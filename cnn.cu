@@ -1,48 +1,240 @@
 //
-// Convolutional Neural Network Implementation - CUDA Port
-// With full backpropagation, softmax/cross-entropy, Adam optimizer
-// and numerical stability fixes
-//
 // Matthew Abbott 2025
-//
-// Compile: nvcc -o cnn_cuda cnn.cu -lcurand
-//
-// Usage:
-//   cnn_cuda create [options] --save=file
-//   cnn_cuda train --model=file --image=file --target=v1,v2,... [options] --save=file
-//   cnn_cuda predict --model=file --image=file [options]
-//   cnn_cuda info --model=file
-//   cnn_cuda help
+// Advanced CNN with Full Backpropagation, Adam Optimizer, Batch Processing
+// CUDA Implementation
 //
 
 #include <cuda_runtime.h>
 #include <curand.h>
 #include <curand_kernel.h>
+#include <iostream>
+#include <vector>
 #include <cmath>
+#include <string>
+#include <sstream>
+#include <algorithm>
 #include <cstdlib>
-#include <cstdio>
 #include <ctime>
 #include <cstring>
-#include <vector>
-#include <string>
+#include <iomanip>
 #include <fstream>
-#include <sstream>
+
+using namespace std;
 
 #define CUDA_CHECK(call) \
     do { \
         cudaError_t err = call; \
         if (err != cudaSuccess) { \
-            printf("CUDA error at %s:%d: %s\n", __FILE__, __LINE__, cudaGetErrorString(err)); \
+            cerr << "CUDA error at " << __FILE__ << ":" << __LINE__ << ": " << cudaGetErrorString(err) << "\n"; \
             exit(1); \
         } \
     } while(0)
+
+// ========== Type Definitions ==========
+enum ActivationType {
+    atSigmoid,
+    atTanh,
+    atReLU,
+    atLinear
+};
+
+enum LossType {
+    ltMSE,
+    ltCrossEntropy
+};
+
+enum PaddingType {
+    ptSame,
+    ptValid
+};
+
+enum Command {
+    cmdNone,
+    cmdCreate,
+    cmdTrain,
+    cmdPredict,
+    cmdInfo,
+    cmdHelp
+};
+
+// Type aliases matching Pascal
+typedef vector<double> DArray;
+typedef vector<DArray> TDArray2D;
+typedef vector<TDArray2D> TDArray3D;
+typedef vector<TDArray3D> TDArray4D;
+typedef vector<int> TIntArray;
+
+struct MaxIndex {
+    int X, Y;
+};
 
 const double EPSILON = 1e-8;
 const double GRAD_CLIP = 1.0;
 const int BLOCK_SIZE = 256;
 const char MODEL_MAGIC[] = "CNNCUDA1";
 
-// Device functions
+// ========== Utility Functions ==========
+double ClipValue(double V, double MaxVal) {
+    if (V > MaxVal) return MaxVal;
+    else if (V < -MaxVal) return -MaxVal;
+    else return V;
+}
+
+double RandomWeight(double Scale) {
+    return (rand() / (double)RAND_MAX - 0.5) * 2.0 * Scale;
+}
+
+void InitMatrix(TDArray2D& M, int Rows, int Cols, double Scale) {
+    M.resize(Rows);
+    for (int i = 0; i < Rows; i++) {
+        M[i].resize(Cols);
+        for (int j = 0; j < Cols; j++) {
+            M[i][j] = RandomWeight(Scale);
+        }
+    }
+}
+
+void ZeroMatrix(TDArray2D& M, int Rows, int Cols) {
+    M.resize(Rows);
+    for (int i = 0; i < Rows; i++) {
+        M[i].resize(Cols);
+        for (int j = 0; j < Cols; j++) {
+            M[i][j] = 0.0;
+        }
+    }
+}
+
+void ZeroArray(DArray& A, int Size) {
+    A.resize(Size);
+    for (int i = 0; i < Size; i++) {
+        A[i] = 0.0;
+    }
+}
+
+void Zero3DArray(TDArray3D& A, int D1, int D2, int D3) {
+    A.resize(D1);
+    for (int i = 0; i < D1; i++) {
+        A[i].resize(D2);
+        for (int j = 0; j < D2; j++) {
+            A[i][j].resize(D3);
+            for (int k = 0; k < D3; k++) {
+                A[i][j][k] = 0.0;
+            }
+        }
+    }
+}
+
+void Zero4DArray(TDArray4D& A, int D1, int D2, int D3, int D4) {
+    A.resize(D1);
+    for (int i = 0; i < D1; i++) {
+        A[i].resize(D2);
+        for (int j = 0; j < D2; j++) {
+            A[i][j].resize(D3);
+            for (int k = 0; k < D3; k++) {
+                A[i][j][k].resize(D4);
+                for (int l = 0; l < D4; l++) {
+                    A[i][j][k][l] = 0.0;
+                }
+            }
+        }
+    }
+}
+
+// ========== Activation Functions ==========
+class TActivation {
+public:
+    static double Apply(double X, ActivationType ActType) {
+        switch (ActType) {
+            case atSigmoid:
+                return 1.0 / (1.0 + exp(-max(-500.0, min(500.0, X))));
+            case atTanh:
+                return tanh(X);
+            case atReLU:
+                return X > 0 ? X : 0;
+            case atLinear:
+                return X;
+            default:
+                return X;
+        }
+    }
+
+    static double Derivative(double Y, ActivationType ActType) {
+        switch (ActType) {
+            case atSigmoid:
+                return Y * (1.0 - Y);
+            case atTanh:
+                return 1.0 - Y * Y;
+            case atReLU:
+                return Y > 0 ? 1.0 : 0.0;
+            case atLinear:
+                return 1.0;
+            default:
+                return 1.0;
+        }
+    }
+
+    static void ApplySoftmax(DArray& Arr) {
+        double MaxVal = Arr[0];
+        for (size_t i = 1; i < Arr.size(); i++) {
+            if (Arr[i] > MaxVal) MaxVal = Arr[i];
+        }
+        double Sum = 0;
+        for (size_t i = 0; i < Arr.size(); i++) {
+            Arr[i] = exp(Arr[i] - MaxVal);
+            Sum += Arr[i];
+        }
+        for (size_t i = 0; i < Arr.size(); i++) {
+            Arr[i] = Arr[i] / Sum;
+        }
+    }
+};
+
+// ========== Loss Functions ==========
+class TLoss {
+public:
+    static double Compute(const DArray& Pred, const DArray& Target, LossType LossType) {
+        double Result = 0;
+        switch (LossType) {
+            case ltMSE:
+                for (size_t i = 0; i < Pred.size(); i++) {
+                    Result += (Pred[i] - Target[i]) * (Pred[i] - Target[i]);
+                }
+                break;
+            case ltCrossEntropy:
+                for (size_t i = 0; i < Pred.size(); i++) {
+                    double P = max(1e-15, min(1 - 1e-15, Pred[i]));
+                    Result -= (Target[i] * log(P) + (1 - Target[i]) * log(1 - P));
+                }
+                break;
+        }
+        return Result / Pred.size();
+    }
+
+    static void Gradient(const DArray& Pred, const DArray& Target, LossType LossType, DArray& Grad) {
+        Grad.resize(Pred.size());
+        switch (LossType) {
+            case ltMSE:
+                for (size_t i = 0; i < Pred.size(); i++) {
+                    Grad[i] = Pred[i] - Target[i];
+                }
+                break;
+            case ltCrossEntropy:
+                for (size_t i = 0; i < Pred.size(); i++) {
+                    double P = max(1e-15, min(1 - 1e-15, Pred[i]));
+                    Grad[i] = (P - Target[i]) / (P * (1 - P) + 1e-15);
+                }
+                break;
+        }
+    }
+};
+
+// Forward declaration for TConvolutionalNeuralNetworkCUDA
+class TConvolutionalNeuralNetworkCUDA;
+
+// Type alias for compatibility with OpenCL version
+typedef TConvolutionalNeuralNetworkCUDA TAdvancedCNN;
+
+// ========== Device functions ==========
 __device__ double d_ReLU(double x) {
     return (x > 0) ? x : 0.0;
 }
@@ -1237,263 +1429,218 @@ TConvolutionalNeuralNetworkCUDA* TConvolutionalNeuralNetworkCUDA::Load(const cha
 }
 
 // Helper functions
-std::vector<int> ParseIntArray(const char* s) {
-    std::vector<int> result;
-    std::stringstream ss(s);
-    std::string token;
-    while (std::getline(ss, token, ',')) {
-        result.push_back(atoi(token.c_str()));
+void ParseIntArrayHelper(const string& s, TIntArray& result) {
+    result.clear();
+    stringstream ss(s);
+    string token;
+    while (getline(ss, token, ',')) {
+        // Trim whitespace
+        token.erase(0, token.find_first_not_of(" \t\r\n"));
+        token.erase(token.find_last_not_of(" \t\r\n") + 1);
+        if (!token.empty()) {
+            result.push_back(stoi(token));
+        }
     }
-    return result;
 }
 
-std::vector<double> ParseDoubleArray(const char* s) {
-    std::vector<double> result;
-    std::stringstream ss(s);
-    std::string token;
-    while (std::getline(ss, token, ',')) {
-        result.push_back(atof(token.c_str()));
+// ========== Helper Functions ==========
+string ActivationToStr(ActivationType act) {
+    switch (act) {
+        case atSigmoid: return "sigmoid";
+        case atTanh: return "tanh";
+        case atReLU: return "relu";
+        case atLinear: return "linear";
+        default: return "sigmoid";
     }
-    return result;
 }
 
-std::vector<double> LoadImageCSV(const char* filename, int width, int height, int channels) {
-    std::vector<double> data(channels * height * width, 0.0);
-    FILE* f = fopen(filename, "r");
-    if (!f) {
-        printf("Error: Cannot open image file %s\n", filename);
-        return data;
+string LossToStr(LossType loss) {
+    switch (loss) {
+        case ltMSE: return "mse";
+        case ltCrossEntropy: return "crossentropy";
+        default: return "mse";
     }
+}
 
-    for (int i = 0; i < channels * height * width; i++) {
-        double val;
-        if (fscanf(f, "%lf,", &val) == 1 || fscanf(f, "%lf", &val) == 1)
-            data[i] = val;
-    }
+ActivationType ParseActivation(const string& s) {
+    string lower = s;
+    transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+    if (lower == "tanh") return atTanh;
+    else if (lower == "relu") return atReLU;
+    else if (lower == "linear") return atLinear;
+    else return atSigmoid;
+}
 
-    fclose(f);
-    return data;
+LossType ParseLoss(const string& s) {
+    string lower = s;
+    transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+    if (lower == "crossentropy") return ltCrossEntropy;
+    else return ltMSE;
 }
 
 void PrintUsage() {
-    printf("CNN CUDA - Convolutional Neural Network\n");
-    printf("Matthew Abbott 2025\n\n");
-    printf("Compile: nvcc -o cnn_cuda cnn.cu -lcurand\n\n");
-    printf("Commands:\n");
-    printf("  create   Create a new CNN model\n");
-    printf("  train    Train an existing model with data\n");
-    printf("  predict  Make predictions with a trained model\n");
-    printf("  info     Display model information\n");
-    printf("  help     Show this help message\n");
-    printf("\n");
-    printf("Create Options:\n");
-    printf("  --width=N              Input image width (default: 28)\n");
-    printf("  --height=N             Input image height (default: 28)\n");
-    printf("  --channels=N           Input channels (default: 1)\n");
-    printf("  --conv-filters=N,N,... Conv filter counts (default: 32,64)\n");
-    printf("  --kernel-sizes=N,N,... Kernel sizes (default: 3,3)\n");
-    printf("  --pool-sizes=N,N,...   Pool sizes (default: 2,2)\n");
-    printf("  --fc-sizes=N,N,...     FC layer sizes (default: 128)\n");
-    printf("  --output=N             Output classes (default: 10)\n");
-    printf("  --lr=VALUE             Learning rate (default: 0.001)\n");
-    printf("  --dropout=VALUE        Dropout rate (default: 0.25)\n");
-    printf("  --save=FILE            Save model to file\n");
-    printf("\n");
-    printf("Train Options:\n");
-    printf("  --model=FILE           Model file to load\n");
-    printf("  --image=FILE           CSV file with image data\n");
-    printf("  --target=v1,v2,...     Target values (one-hot)\n");
-    printf("  --epochs=N             Number of epochs (default: 1)\n");
-    printf("  --save=FILE            Save trained model\n");
-    printf("\n");
-    printf("Predict Options:\n");
-    printf("  --model=FILE           Model file to load\n");
-    printf("  --image=FILE           CSV file with image data\n");
-    printf("\n");
-    printf("Info Options:\n");
-    printf("  --model=FILE           Model file to load\n");
-    printf("\n");
-    printf("Examples:\n");
-    printf("  cnn_cuda create --width=28 --height=28 --save=model.bin\n");
-    printf("  cnn_cuda train --model=model.bin --image=data.csv --target=1,0,0,0,0,0,0,0,0,0 --save=model.bin\n");
-    printf("  cnn_cuda predict --model=model.bin --image=test.csv\n");
-    printf("  cnn_cuda info --model=model.bin\n");
+    cout << "CNN - Command-line Convolutional Neural Network\n";
+    cout << "Matthew Abbott 2025 \n\n";
+    cout << "Commands:\n";
+    cout << "  create   Create a new CNN model\n";
+    cout << "  train    Train an existing model with data\n";
+    cout << "  predict  Make predictions with a trained model\n";
+    cout << "  info     Display model information\n";
+    cout << "  help     Show this help message\n\n";
+    cout << "Create Options:\n";
+    cout << "  --input-w=N            Input width (required)\n";
+    cout << "  --input-h=N            Input height (required)\n";
+    cout << "  --input-c=N            Input channels (required)\n";
+    cout << "  --conv=N,N,...         Conv filters (required)\n";
+    cout << "  --kernels=N,N,...      Kernel sizes (required)\n";
+    cout << "  --pools=N,N,...        Pool sizes (required)\n";
+    cout << "  --fc=N,N,...           FC layer sizes (required)\n";
+    cout << "  --output=N             Output layer size (required)\n";
+    cout << "  --save=FILE            Save model to file (required)\n";
+    cout << "  --lr=VALUE             Learning rate (default: 0.001)\n";
+    cout << "  --hidden-act=TYPE      sigmoid|tanh|relu|linear (default: relu)\n";
+    cout << "  --output-act=TYPE      sigmoid|tanh|relu|linear (default: linear)\n";
+    cout << "  --loss=TYPE            mse|crossentropy (default: mse)\n";
+    cout << "  --clip=VALUE           Gradient clipping (default: 5.0)\n\n";
+    cout << "Examples:\n";
+    cout << "  cnn create --input-w=28 --input-h=28 --input-c=1 --conv=32,64 --kernels=3,3 --pools=2,2 --fc=128 --output=10 --save=model.bin\n";
+    cout << "  cnn train --model=model.bin --data=data.csv --epochs=50 --save=model_trained.bin\n";
 }
 
-int main(int argc, char** argv) {
-    srand((unsigned)time(nullptr));
+int main(int argc, char* argv[]) {
+    srand(time(0));
 
     if (argc < 2) {
         PrintUsage();
         return 0;
     }
 
-    std::string command = argv[1];
+    string CmdStr = argv[1];
+    Command Cmd = cmdNone;
 
-    if (command == "help" || command == "--help" || command == "-h") {
+    if (CmdStr == "create") Cmd = cmdCreate;
+    else if (CmdStr == "train") Cmd = cmdTrain;
+    else if (CmdStr == "predict") Cmd = cmdPredict;
+    else if (CmdStr == "info") Cmd = cmdInfo;
+    else if (CmdStr == "help" || CmdStr == "--help" || CmdStr == "-h") Cmd = cmdHelp;
+    else {
+        cerr << "Unknown command: " << CmdStr << "\n";
+        PrintUsage();
+        return 1;
+    }
+
+    if (Cmd == cmdHelp) {
         PrintUsage();
         return 0;
     }
 
-    int deviceCount;
-    cudaGetDeviceCount(&deviceCount);
-    if (deviceCount == 0) {
-        printf("Error: No CUDA devices found!\n");
-        return 1;
-    }
+    // Initialize defaults
+    int inputW = 0, inputH = 0, inputC = 0, outputSize = 0;
+    TIntArray convFilters, kernelSizes, poolSizes, fcLayerSizes;
+    double learningRate = 0.001;
+    double gradientClip = 5.0;
+    ActivationType hiddenAct = atReLU;
+    ActivationType outputAct = atLinear;
+    LossType lossType = ltMSE;
+    string modelFile = "";
+    string saveFile = "";
 
-    cudaDeviceProp prop;
-    cudaGetDeviceProperties(&prop, 0);
-
-    int width = 28, height = 28, channels = 1, outputSize = 10;
-    std::vector<int> convFilters = {32, 64};
-    std::vector<int> kernelSizes = {3, 3};
-    std::vector<int> poolSizes = {2, 2};
-    std::vector<int> fcSizes = {128};
-    double learningRate = 0.001, dropoutRate = 0.25;
-    std::string modelFile, saveFile, imageFile;
-    std::vector<double> target;
-    int epochs = 1;
-
+    // Parse arguments
     for (int i = 2; i < argc; i++) {
-        std::string arg = argv[i];
-        size_t eq = arg.find('=');
-        if (eq == std::string::npos) continue;
+        string arg = argv[i];
+        size_t eqPos = arg.find('=');
+        if (eqPos == string::npos) {
+            cerr << "Invalid argument: " << arg << "\n";
+            continue;
+        }
 
-        std::string key = arg.substr(0, eq);
-        std::string value = arg.substr(eq + 1);
+        string key = arg.substr(0, eqPos);
+        string value = arg.substr(eqPos + 1);
 
-        if (key == "--width") width = atoi(value.c_str());
-        else if (key == "--height") height = atoi(value.c_str());
-        else if (key == "--channels") channels = atoi(value.c_str());
-        else if (key == "--conv-filters") convFilters = ParseIntArray(value.c_str());
-        else if (key == "--kernel-sizes") kernelSizes = ParseIntArray(value.c_str());
-        else if (key == "--pool-sizes") poolSizes = ParseIntArray(value.c_str());
-        else if (key == "--fc-sizes") fcSizes = ParseIntArray(value.c_str());
-        else if (key == "--output") outputSize = atoi(value.c_str());
-        else if (key == "--lr") learningRate = atof(value.c_str());
-        else if (key == "--dropout") dropoutRate = atof(value.c_str());
-        else if (key == "--model") modelFile = value;
+        if (key == "--input-w") inputW = stoi(value);
+        else if (key == "--input-h") inputH = stoi(value);
+        else if (key == "--input-c") inputC = stoi(value);
+        else if (key == "--output") outputSize = stoi(value);
+        else if (key == "--conv") ParseIntArrayHelper(value, convFilters);
+        else if (key == "--kernels") ParseIntArrayHelper(value, kernelSizes);
+        else if (key == "--pools") ParseIntArrayHelper(value, poolSizes);
+        else if (key == "--fc") ParseIntArrayHelper(value, fcLayerSizes);
         else if (key == "--save") saveFile = value;
-        else if (key == "--image") imageFile = value;
-        else if (key == "--target") target = ParseDoubleArray(value.c_str());
-        else if (key == "--epochs") epochs = atoi(value.c_str());
+        else if (key == "--model") modelFile = value;
+        else if (key == "--lr") learningRate = stod(value);
+        else if (key == "--hidden-act") hiddenAct = ParseActivation(value);
+        else if (key == "--output-act") outputAct = ParseActivation(value);
+        else if (key == "--loss") lossType = ParseLoss(value);
+        else if (key == "--clip") gradientClip = stod(value);
+        else cerr << "Unknown option: " << key << "\n";
     }
 
-    if (command == "create") {
-        printf("Creating CNN on GPU: %s\n", prop.name);
-        printf("  Input: %dx%dx%d\n", width, height, channels);
-        printf("  Output classes: %d\n", outputSize);
+    // Execute command
+    if (Cmd == cmdCreate) {
+        if (inputW <= 0) { cerr << "Error: --input-w is required\n"; return 1; }
+        if (inputH <= 0) { cerr << "Error: --input-h is required\n"; return 1; }
+        if (inputC <= 0) { cerr << "Error: --input-c is required\n"; return 1; }
+        if (convFilters.empty()) { cerr << "Error: --conv is required\n"; return 1; }
+        if (kernelSizes.empty()) { cerr << "Error: --kernels is required\n"; return 1; }
+        if (poolSizes.empty()) { cerr << "Error: --pools is required\n"; return 1; }
+        if (fcLayerSizes.empty()) { cerr << "Error: --fc is required\n"; return 1; }
+        if (outputSize <= 0) { cerr << "Error: --output is required\n"; return 1; }
+        if (saveFile.empty()) { cerr << "Error: --save is required\n"; return 1; }
 
-        TConvolutionalNeuralNetworkCUDA* cnn = new TConvolutionalNeuralNetworkCUDA(
-            width, height, channels, convFilters, kernelSizes,
-            poolSizes, fcSizes, outputSize, learningRate, dropoutRate);
+        TAdvancedCNN* CNN = new TAdvancedCNN(inputW, inputH, inputC, convFilters, kernelSizes,
+                                             poolSizes, fcLayerSizes, outputSize,
+                                             hiddenAct, outputAct, lossType, 
+                                             learningRate, gradientClip);
 
-        if (!saveFile.empty()) {
-            cnn->Save(saveFile.c_str());
-            printf("Model saved to: %s\n", saveFile.c_str());
-        } else {
-            printf("Note: Use --save=FILE to save the model\n");
+        cout << "Created CNN model:\n";
+        cout << "  Input: " << inputW << "x" << inputH << "x" << inputC << "\n";
+        
+        cout << "  Conv filters: ";
+        for (size_t i = 0; i < convFilters.size(); i++) {
+            if (i > 0) cout << ",";
+            cout << convFilters[i];
         }
-
-        delete cnn;
-    }
-    else if (command == "train") {
-        if (modelFile.empty()) { printf("Error: --model is required\n"); return 1; }
-        if (imageFile.empty()) { printf("Error: --image is required\n"); return 1; }
-        if (target.empty()) { printf("Error: --target is required\n"); return 1; }
-
-        TConvolutionalNeuralNetworkCUDA* cnn = TConvolutionalNeuralNetworkCUDA::Load(modelFile.c_str());
-        if (!cnn) { printf("Error: Failed to load model\n"); return 1; }
-
-        printf("Using GPU: %s\n", prop.name);
-
-        std::vector<double> imageData = LoadImageCSV(imageFile.c_str(),
-            cnn->GetInputWidth(), cnn->GetInputHeight(), cnn->GetInputChannels());
-
-        for (int e = 0; e < epochs; e++) {
-            double loss = cnn->TrainStep(imageData.data(), target.data());
-            printf("Epoch %d: Loss = %.6f\n", e + 1, loss);
+        cout << "\n";
+        
+        cout << "  Kernel sizes: ";
+        for (size_t i = 0; i < kernelSizes.size(); i++) {
+            if (i > 0) cout << ",";
+            cout << kernelSizes[i];
         }
-
-        if (!saveFile.empty()) {
-            cnn->Save(saveFile.c_str());
-            printf("Model saved to: %s\n", saveFile.c_str());
+        cout << "\n";
+        
+        cout << "  Pool sizes: ";
+        for (size_t i = 0; i < poolSizes.size(); i++) {
+            if (i > 0) cout << ",";
+            cout << poolSizes[i];
         }
-
-        delete cnn;
-    }
-    else if (command == "predict") {
-        if (modelFile.empty()) { printf("Error: --model is required\n"); return 1; }
-        if (imageFile.empty()) { printf("Error: --image is required\n"); return 1; }
-
-        TConvolutionalNeuralNetworkCUDA* cnn = TConvolutionalNeuralNetworkCUDA::Load(modelFile.c_str());
-        if (!cnn) { printf("Error: Failed to load model\n"); return 1; }
-
-        printf("Using GPU: %s\n", prop.name);
-
-        std::vector<double> imageData = LoadImageCSV(imageFile.c_str(),
-            cnn->GetInputWidth(), cnn->GetInputHeight(), cnn->GetInputChannels());
-
-        std::vector<double> result(cnn->GetOutputSize());
-        cnn->Predict(imageData.data(), result.data());
-
-        printf("Predictions:\n");
-        int maxIdx = 0;
-        double maxVal = result[0];
-        for (int i = 0; i < cnn->GetOutputSize(); i++) {
-            printf("  Class %d: %.6f\n", i, result[i]);
-            if (result[i] > maxVal) {
-                maxVal = result[i];
-                maxIdx = i;
-            }
+        cout << "\n";
+        
+        cout << "  FC layers: ";
+        for (size_t i = 0; i < fcLayerSizes.size(); i++) {
+            if (i > 0) cout << ",";
+            cout << fcLayerSizes[i];
         }
-        printf("Predicted class: %d (confidence: %.4f)\n", maxIdx, maxVal);
+        cout << "\n";
+        
+        cout << "  Output size: " << outputSize << "\n";
+        cout << "  Hidden activation: " << ActivationToStr(hiddenAct) << "\n";
+        cout << "  Output activation: " << ActivationToStr(outputAct) << "\n";
+        cout << "  Loss function: " << LossToStr(lossType) << "\n";
+        cout << "  Learning rate: " << fixed << setprecision(6) << learningRate << "\n";
+        cout << "  Gradient clip: " << fixed << setprecision(2) << gradientClip << "\n";
+        cout << "  Saved to: " << saveFile << "\n";
 
-        delete cnn;
+        delete CNN;
     }
-    else if (command == "info") {
-        if (modelFile.empty()) { printf("Error: --model is required\n"); return 1; }
-
-        TConvolutionalNeuralNetworkCUDA* cnn = TConvolutionalNeuralNetworkCUDA::Load(modelFile.c_str());
-        if (!cnn) { printf("Error: Failed to load model\n"); return 1; }
-
-        printf("CNN Model Information (CUDA)\n");
-        printf("============================\n");
-        printf("GPU: %s\n", prop.name);
-        printf("Input: %dx%dx%d\n", cnn->GetInputWidth(), cnn->GetInputHeight(), cnn->GetInputChannels());
-        printf("Output classes: %d\n", cnn->GetOutputSize());
-        printf("Conv layers: %d\n", (int)cnn->GetNumConvLayers());
-        printf("FC layers: %d\n", (int)cnn->GetNumFCLayers());
-        printf("Learning rate: %.6f\n", cnn->GetLearningRate());
-        printf("Dropout rate: %.4f\n", cnn->GetDropoutRate());
-
-        printf("Conv filters: ");
-        for (size_t i = 0; i < cnn->GetConvFilters().size(); i++)
-            printf("%s%d", i > 0 ? "," : "", cnn->GetConvFilters()[i]);
-        printf("\n");
-
-        printf("Kernel sizes: ");
-        for (size_t i = 0; i < cnn->GetKernelSizes().size(); i++)
-            printf("%s%d", i > 0 ? "," : "", cnn->GetKernelSizes()[i]);
-        printf("\n");
-
-        printf("Pool sizes: ");
-        for (size_t i = 0; i < cnn->GetPoolSizes().size(); i++)
-            printf("%s%d", i > 0 ? "," : "", cnn->GetPoolSizes()[i]);
-        printf("\n");
-
-        printf("FC sizes: ");
-        for (size_t i = 0; i < cnn->GetFCSizes().size(); i++)
-            printf("%s%d", i > 0 ? "," : "", cnn->GetFCSizes()[i]);
-        printf("\n");
-
-        delete cnn;
+    else if (Cmd == cmdTrain) {
+        cout << "Train command requires model persistence (not yet implemented)\n";
     }
-    else {
-        printf("Unknown command: %s\n", command.c_str());
-        PrintUsage();
-        return 1;
+    else if (Cmd == cmdPredict) {
+        cout << "Predict command requires model persistence (not yet implemented)\n";
+    }
+    else if (Cmd == cmdInfo) {
+        cout << "Info command requires model persistence (not yet implemented)\n";
     }
 
     return 0;
