@@ -1,4 +1,3 @@
-// CNN. cpp - Faithful port from Pascal
 //
 // MIT License
 //
