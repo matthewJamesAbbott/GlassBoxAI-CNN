@@ -1,14 +1,27 @@
 //
-// Matthew Abbott 2025
-// Advanced CNN with Full Backpropagation, Adam Optimizer, Batch Processing - OpenCL Version
+// MIT License
 //
-// Compile:
-//   g++ -o cnn_opencl cnn_opencl.cpp -lOpenCL -std=c++11
+// Copyright (c) 2025 Matthew Abbott
 //
-// Usage (commands):
-//   cnn_opencl create --input-w=N --input-h=N --input-c=N --conv=N,N,... --kernels=N,N,... --pools=N,N,... --fc=N,N,... --output=N [options] --save=FILE
-//   cnn_opencl help
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
 //
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+//
+
 #define CL_TARGET_OPENCL_VERSION 120
 #ifdef __APPLE__
 #include <OpenCL/opencl.h>
@@ -530,31 +543,39 @@ void ParseIntArrayHelper(const string& s, TIntArray& result) {
 }
 
 void PrintUsage() {
-    cout << "CNN OpenCL - GPU-accelerated Convolutional Neural Network\n\n";
-    cout << "Commands:\n";
-    cout << "  create   Create a new CNN model\n";
-    cout << "  train    Train an existing model with data\n";
-    cout << "  predict  Make predictions with a trained model\n";
-    cout << "  info     Display model information\n";
-    cout << "  help     Show this help message\n\n";
-    cout << "Create Options:\n";
-    cout << "  --input-w=N            Input width (required)\n";
-    cout << "  --input-h=N            Input height (required)\n";
-    cout << "  --input-c=N            Input channels (required)\n";
-    cout << "  --conv=N,N,...         Conv filters (required)\n";
-    cout << "  --kernels=N,N,...      Kernel sizes (required)\n";
-    cout << "  --pools=N,N,...        Pool sizes (required)\n";
-    cout << "  --fc=N,N,...           FC layer sizes (required)\n";
-    cout << "  --output=N             Output layer size (required)\n";
-    cout << "  --save=FILE            Save model to file (required)\n";
-    cout << "  --lr=VALUE             Learning rate (default: 0.001)\n";
-    cout << "  --hidden-act=TYPE      sigmoid|tanh|relu|linear (default: relu)\n";
-    cout << "  --output-act=TYPE      sigmoid|tanh|relu|linear (default: linear)\n";
-    cout << "  --loss=TYPE            mse|crossentropy (default: mse)\n";
-    cout << "  --clip=VALUE           Gradient clipping (default: 5.0)\n\n";
-    cout << "Examples:\n";
-    cout << "  cnn_opencl create --input-w=28 --input-h=28 --input-c=1 --conv=32,64 --kernels=3,3 --pools=2,2 --fc=128 --output=10 --save=model.bin\n";
-    cout << "  cnn_opencl train --model=model.bin --data=data.csv --epochs=50 --save=model_trained.bin\n";
+    std::cout << "\n=================================================================\n";
+    std::cout << "  CNN - Convolutional Neural Network (OpenCL)\n";
+    std::cout << "=================================================================\n\n";
+    std::cout << "USAGE:\n";
+    std::cout << "  cnn_opencl <command> [options]\n\n";
+    std::cout << "COMMANDS:\n";
+    std::cout << "  help                 Show this help message\n";
+    std::cout << "  info <model.json>    Display model architecture information\n";
+    std::cout << "  create <config>      Create and save a new model\n";
+    std::cout << "  train <config>       Train a model\n";
+    std::cout << "  predict <config>     Run prediction on input data\n\n";
+    std::cout << "EXAMPLES:\n";
+    std::cout << "  cnn_opencl help\n";
+    std::cout << "  cnn_opencl info model.json\n";
+    std::cout << "  cnn_opencl create --model model.json --input 28,28,1 --conv 16,32 --kernels 3,3 --pool 2,2 --fc 128 --output 10\n";
+    std::cout << "  cnn_opencl train --model model.json --data train.json --epochs 10 --batch 32 --lr 0.001\n";
+    std::cout << "  cnn_opencl predict --model model.json --input image.json\n\n";
+    std::cout << "OPTIONS:\n";
+    std::cout << "  --model <file>       Model file path (JSON)\n";
+    std::cout << "  --input <W,H,C>      Input dimensions (width,height,channels)\n";
+    std::cout << "  --conv <F1,F2,...>   Convolutional filter counts per layer\n";
+    std::cout << "  --kernels <K1,K2>    Kernel sizes per conv layer\n";
+    std::cout << "  --pool <P1,P2>       Pooling sizes per layer\n";
+    std::cout << "  --fc <N1,N2,...>     Fully connected layer sizes\n";
+    std::cout << "  --output <N>         Output size (number of classes)\n";
+    std::cout << "  --activation <type>  Activation function:  sigmoid, tanh, relu, linear (default: relu)\n";
+    std::cout << "  --loss <type>        Loss function: mse, crossentropy (default: crossentropy)\n";
+    std::cout << "  --lr <rate>          Learning rate (default: 0.001)\n";
+    std::cout << "  --clip <value>       Gradient clipping value (default: 5.0)\n";
+    std::cout << "  --data <file>        Training/test data file (JSON)\n";
+    std::cout << "  --epochs <N>         Number of training epochs\n";
+    std::cout << "  --batch <N>          Batch size for training\n";
+    std::cout << "  --validation <rate>  Validation split ratio (default: 0.2)\n\n";
 }
 
 // ========== Convolutional Filter ==========
@@ -1189,6 +1210,383 @@ public:
     void SetLearningRate(double LR) { FLearningRate = LR; }
     double GetGradientClip() const { return FGradientClip; }
     void SetGradientClip(double GC) { FGradientClip = GC; }
+    
+    std::string Array1DToJSON(const FArray& Arr) {
+        std::ostringstream oss;
+        oss << std::setprecision(17);
+        oss << "[";
+        for (size_t i = 0; i < Arr.size(); i++) {
+            oss << Arr[i];
+            if (i < Arr.size() - 1) oss << ",";
+        }
+        oss << "]";
+        return oss.str();
+    }
+    
+    std::string Array2DToJSON(const TFArray2D& Arr) {
+        std::ostringstream oss;
+        oss << std::setprecision(17);
+        oss << "[";
+        for (size_t i = 0; i < Arr.size(); i++) {
+            oss << Array1DToJSON(Arr[i]);
+            if (i < Arr.size() - 1) oss << ",";
+        }
+        oss << "]";
+        return oss.str();
+    }
+    
+    std::string Array3DToJSON(const TFArray3D& Arr) {
+        std::ostringstream oss;
+        oss << std::setprecision(17);
+        oss << "[";
+        for (size_t i = 0; i < Arr.size(); i++) {
+            oss << Array2DToJSON(Arr[i]);
+            if (i < Arr.size() - 1) oss << ",";
+        }
+        oss << "]";
+        return oss.str();
+    }
+    
+    std::string Array4DToJSON(const TFArray4D& Arr) {
+        std::ostringstream oss;
+        oss << std::setprecision(17);
+        oss << "[";
+        for (size_t i = 0; i < Arr.size(); i++) {
+            oss << Array3DToJSON(Arr[i]);
+            if (i < Arr.size() - 1) oss << ",";
+        }
+        oss << "]";
+        return oss.str();
+    }
+    
+    void SaveModelToJSON(const std::string& Filename) {
+        std::ofstream file(Filename);
+        if (!file.is_open()) {
+            throw std::runtime_error("Cannot open file for writing: " + Filename);
+        }
+        
+        file << std::setprecision(17);
+        file << "{\n";
+        
+        // Model architecture
+        file << "  \"input_width\": " << FInputWidth << ",\n";
+        file << "  \"input_height\": " << FInputHeight << ",\n";
+        file << "  \"input_channels\": " << FInputChannels << ",\n";
+        file << "  \"output_size\": " << FOutputSize << ",\n";
+        file << "  \"learning_rate\": " << FLearningRate << ",\n";
+        file << "  \"gradient_clip\": " << FGradientClip << ",\n";
+        
+        // Activation types
+        file << "  \"activation\": " << static_cast<int>(FActivation) << ",\n";
+        file << "  \"output_activation\": " << static_cast<int>(FOutputActivation) << ",\n";
+        file << "  \"loss_type\": " << static_cast<int>(FLossType) << ",\n";
+        
+        // Convolutional layers
+        file << "  \"conv_layers\": [\n";
+        for (size_t i = 0; i < FConvLayers.size(); i++) {
+            file << "    {\n";
+            file << "      \"filters\": [\n";
+            for (size_t f = 0; f < FConvLayers[i]->Filters.size(); f++) {
+                file << "        {\n";
+                file << "          \"weights\": " << Array4DToJSON(FConvLayers[i]->Filters[f]->Weights) << ",\n";
+                file << "          \"bias\": " << FConvLayers[i]->Filters[f]->Bias << "\n";
+                file << "        }";
+                if (f < FConvLayers[i]->Filters.size() - 1) file << ",";
+                file << "\n";
+            }
+            file << "      ]\n";
+            file << "    }";
+            if (i < FConvLayers.size() - 1) file << ",";
+            file << "\n";
+        }
+        file << "  ],\n";
+        
+        // Fully connected layers
+        file << "  \"fc_layers\": [\n";
+        for (size_t i = 0; i < FFullyConnectedLayers.size(); i++) {
+            file << "    {\n";
+            file << "      \"weights\": " << Array2DToJSON(FFullyConnectedLayers[i]->W) << ",\n";
+            file << "      \"bias\": " << Array1DToJSON(FFullyConnectedLayers[i]->B) << "\n";
+            file << "    }";
+            if (i < FFullyConnectedLayers.size() - 1) file << ",";
+            file << "\n";
+        }
+        file << "  ],\n";
+        
+        // Output layer
+        file << "  \"output_layer\": {\n";
+        file << "    \"weights\": " << Array2DToJSON(FOutputLayer->W) << ",\n";
+        file << "    \"bias\": " << Array1DToJSON(FOutputLayer->B) << "\n";
+        file << "  }\n";
+        
+        file << "}\n";
+        file.close();
+    }
+    
+    void LoadModelFromJSON(const std::string& Filename) {
+        std::ifstream file(Filename);
+        if (!file.is_open()) {
+            throw std::runtime_error("Cannot open file for reading: " + Filename);
+        }
+        
+        std::string content((std::istreambuf_iterator<char>(file)),
+                            std::istreambuf_iterator<char>());
+        file.close();
+        
+        // Simple JSON parser for the specific structure we saved
+        auto findValue = [&content](const std::string& key) -> std::string {
+            std::string searchKey = "\"" + key + "\": ";
+            size_t pos = content.find(searchKey);
+            if (pos == std::string::npos) return "";
+            
+            pos += searchKey.length();
+            while (pos < content.length() && (content[pos] == ' ' || content[pos] == '\n')) pos++;
+            
+            size_t endPos = pos;
+            if (content[pos] == '"') {
+                endPos = content.find('"', pos + 1);
+                return content.substr(pos + 1, endPos - pos - 1);
+            } else if (content[pos] == '[' || content[pos] == '{') {
+                int depth = 0;
+                char startChar = content[pos];
+                char endChar = (startChar == '[') ? ']' : '}';
+                do {
+                    if (content[endPos] == startChar) depth++;
+                    if (content[endPos] == endChar) depth--;
+                    endPos++;
+                } while (depth > 0 && endPos < content.length());
+                return content.substr(pos, endPos - pos);
+            } else {
+                while (endPos < content.length() && content[endPos] != ',' &&
+                       content[endPos] != '\n' && content[endPos] != '}') endPos++;
+                return content.substr(pos, endPos - pos);
+            }
+        };
+        
+        auto parseArray1D = [](const std::string& str) -> FArray {
+            FArray result;
+            if (str.empty() || str[0] != '[') return result;
+            
+            std::string nums = str.substr(1, str.length() - 2);
+            std::istringstream iss(nums);
+            std::string token;
+            while (std::getline(iss, token, ',')) {
+                result.push_back(std::stof(token));
+            }
+            return result;
+        };
+        
+        auto parseArray2D = [&parseArray1D](const std::string& str) -> TFArray2D {
+            TFArray2D result;
+            if (str.empty() || str[0] != '[') return result;
+            
+            size_t pos = 1;
+            int depth = 0;
+            size_t start = pos;
+            
+            while (pos < str.length() - 1) {
+                if (str[pos] == '[') {
+                    if (depth == 0) start = pos;
+                    depth++;
+                } else if (str[pos] == ']') {
+                    depth--;
+                    if (depth == 0) {
+                        result.push_back(parseArray1D(str.substr(start, pos - start + 1)));
+                    }
+                }
+                pos++;
+            }
+            return result;
+        };
+        
+        auto parseArray4D = [&](const std::string& str) -> TFArray4D {
+            TFArray4D result;
+            if (str.empty() || str[0] != '[') return result;
+            
+            size_t pos = 1;
+            int depth = 0;
+            size_t start = pos;
+            
+            while (pos < str.length() - 1) {
+                if (str[pos] == '[') {
+                    if (depth == 0) start = pos;
+                    depth++;
+                } else if (str[pos] == ']') {
+                    depth--;
+                    if (depth == 0) {
+                        // Parse 3D array
+                        TFArray3D arr3d;
+                        std::string str3d = str.substr(start, pos - start + 1);
+                        
+                        size_t pos3 = 1;
+                        int depth3 = 0;
+                        size_t start3 = pos3;
+                        
+                        while (pos3 < str3d.length() - 1) {
+                            if (str3d[pos3] == '[') {
+                                if (depth3 == 0) start3 = pos3;
+                                depth3++;
+                            } else if (str3d[pos3] == ']') {
+                                depth3--;
+                                if (depth3 == 0) {
+                                    arr3d.push_back(parseArray2D(str3d.substr(start3, pos3 - start3 + 1)));
+                                }
+                            }
+                            pos3++;
+                        }
+                        result.push_back(arr3d);
+                    }
+                }
+                pos++;
+            }
+            return result;
+        };
+        
+        // Load architecture parameters
+        FLearningRate = std::stod(findValue("learning_rate"));
+        FGradientClip = std::stod(findValue("gradient_clip"));
+        
+        // Load convolutional layers weights
+        std::string convLayersStr = findValue("conv_layers");
+        size_t convPos = 0;
+        int convDepth = 0;
+        size_t convLayerIdx = 0;
+        
+        while (convPos < convLayersStr.length() && convLayerIdx < FConvLayers.size()) {
+            if (convLayersStr[convPos] == '{' && convDepth == 1) {
+                // Find filters array for this layer
+                size_t filtersStart = convLayersStr.find("\"filters\":", convPos);
+                if (filtersStart != std::string::npos) {
+                    filtersStart = convLayersStr.find('[', filtersStart);
+                    int filterDepth = 0;
+                    size_t filtersEnd = filtersStart;
+                    do {
+                        if (convLayersStr[filtersEnd] == '[') filterDepth++;
+                        if (convLayersStr[filtersEnd] == ']') filterDepth--;
+                        filtersEnd++;
+                    } while (filterDepth > 0);
+                    
+                    std::string filtersStr = convLayersStr.substr(filtersStart, filtersEnd - filtersStart);
+                    
+                    // Parse each filter
+                    size_t filterPos = 1;
+                    size_t filterIdx = 0;
+                    int fDepth = 0;
+                    
+                    while (filterPos < filtersStr.length() && filterIdx < FConvLayers[convLayerIdx]->Filters.size()) {
+                        if (filtersStr[filterPos] == '{') {
+                            if (fDepth == 0) {
+                                size_t weightsStart = filtersStr.find("\"weights\":", filterPos);
+                                size_t weightsValStart = filtersStr.find('[', weightsStart);
+                                int wDepth = 0;
+                                size_t weightsEnd = weightsValStart;
+                                do {
+                                    if (filtersStr[weightsEnd] == '[') wDepth++;
+                                    if (filtersStr[weightsEnd] == ']') wDepth--;
+                                    weightsEnd++;
+                                } while (wDepth > 0);
+                                
+                                std::string weightsStr = filtersStr.substr(weightsValStart, weightsEnd - weightsValStart);
+                                FConvLayers[convLayerIdx]->Filters[filterIdx]->Weights = parseArray4D(weightsStr);
+                                
+                                size_t biasStart = filtersStr.find("\"bias\":", filterPos);
+                                size_t biasValStart = biasStart + 7;
+                                while (filtersStr[biasValStart] == ' ') biasValStart++;
+                                size_t biasEnd = filtersStr.find_first_of(",\n}", biasValStart);
+                                FConvLayers[convLayerIdx]->Filters[filterIdx]->Bias =
+                                    std::stof(filtersStr.substr(biasValStart, biasEnd - biasValStart));
+                                
+                                filterIdx++;
+                            }
+                            fDepth++;
+                        } else if (filtersStr[filterPos] == '}') {
+                            fDepth--;
+                        }
+                        filterPos++;
+                    }
+                    
+                    convPos = filtersEnd + convPos;
+                    convLayerIdx++;
+                }
+            }
+            if (convLayersStr[convPos] == '{') convDepth++;
+            if (convLayersStr[convPos] == '}') convDepth--;
+            convPos++;
+        }
+        
+        // Load fully connected layers
+        std::string fcLayersStr = findValue("fc_layers");
+        size_t fcPos = 1;
+        size_t fcLayerIdx = 0;
+        int fcDepth = 0;
+        
+        while (fcPos < fcLayersStr.length() && fcLayerIdx < FFullyConnectedLayers.size()) {
+            if (fcLayersStr[fcPos] == '{') {
+                if (fcDepth == 0) {
+                    size_t weightsStart = fcLayersStr.find("\"weights\":", fcPos);
+                    size_t weightsValStart = fcLayersStr.find('[', weightsStart);
+                    int wDepth = 0;
+                    size_t weightsEnd = weightsValStart;
+                    do {
+                        if (fcLayersStr[weightsEnd] == '[') wDepth++;
+                        if (fcLayersStr[weightsEnd] == ']') wDepth--;
+                        weightsEnd++;
+                    } while (wDepth > 0);
+                    
+                    std::string weightsStr = fcLayersStr.substr(weightsValStart, weightsEnd - weightsValStart);
+                    FFullyConnectedLayers[fcLayerIdx]->W = parseArray2D(weightsStr);
+                    
+                    size_t biasStart = fcLayersStr.find("\"bias\":", fcPos);
+                    size_t biasValStart = fcLayersStr.find('[', biasStart);
+                    int bDepth = 0;
+                    size_t biasEnd = biasValStart;
+                    do {
+                        if (fcLayersStr[biasEnd] == '[') bDepth++;
+                        if (fcLayersStr[biasEnd] == ']') bDepth--;
+                        biasEnd++;
+                    } while (bDepth > 0);
+                    
+                    std::string biasStr = fcLayersStr.substr(biasValStart, biasEnd - biasValStart);
+                    FFullyConnectedLayers[fcLayerIdx]->B = parseArray1D(biasStr);
+                    
+                    fcLayerIdx++;
+                }
+                fcDepth++;
+            } else if (fcLayersStr[fcPos] == '}') {
+                fcDepth--;
+            }
+            fcPos++;
+        }
+        
+        // Load output layer
+        std::string outputLayerStr = findValue("output_layer");
+        
+        size_t weightsStart = outputLayerStr.find("\"weights\":");
+        size_t weightsValStart = outputLayerStr.find('[', weightsStart);
+        int wDepth = 0;
+        size_t weightsEnd = weightsValStart;
+        do {
+            if (outputLayerStr[weightsEnd] == '[') wDepth++;
+            if (outputLayerStr[weightsEnd] == ']') wDepth--;
+            weightsEnd++;
+        } while (wDepth > 0);
+        
+        std::string weightsStr = outputLayerStr.substr(weightsValStart, weightsEnd - weightsValStart);
+        FOutputLayer->W = parseArray2D(weightsStr);
+        
+        size_t biasStart = outputLayerStr.find("\"bias\":");
+        size_t biasValStart = outputLayerStr.find('[', biasStart);
+        int bDepth = 0;
+        size_t biasEnd = biasValStart;
+        do {
+            if (outputLayerStr[biasEnd] == '[') bDepth++;
+            if (outputLayerStr[biasEnd] == ']') bDepth--;
+            biasEnd++;
+        } while (bDepth > 0);
+        
+        std::string biasStr = outputLayerStr.substr(biasValStart, biasEnd - biasValStart);
+        FOutputLayer->B = parseArray1D(biasStr);
+    }
 };
 
 // ========== Main Program ==========
