@@ -1,72 +1,68 @@
-//
-// MIT License
-//
-// Copyright (c) 2025 Matthew Abbott
-//
-// Permission is hereby granted, free of charge, to any person obtaining a copy
-// of this software and associated documentation files (the "Software"), to deal
-// in the Software without restriction, including without limitation the rights
-// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-// copies of the Software, and to permit persons to whom the Software is
-// furnished to do so, subject to the following conditions:
-//
-// The above copyright notice and this permission notice shall be included in all
-// copies or substantial portions of the Software.
-//
-// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL THE
-// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-// SOFTWARE.
-//
+/*
+ * MIT License
+ *
+ * Copyright (c) 2025 Matthew Abbott
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in all
+ * copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
+ */.
 
-#define CL_TARGET_OPENCL_VERSION 120
-#ifdef __APPLE__
-#include <OpenCL/opencl.h>
-#else
-#include <CL/cl.h>
-#endif
+#ifndef CNN_OPENCL_H
+#define CNN_OPENCL_H
 
-#include <iostream>
 #include <vector>
 #include <cmath>
 #include <string>
+#include <fstream>
 #include <sstream>
 #include <algorithm>
-#include <cstdlib>
-#include <ctime>
-#include <cstring>
+#include <random>
 #include <iomanip>
-#include <fstream>
-#include <map>
+#include <iostream>
+#include <ctime>
+#include <CL/cl.h>
 
-using namespace std;
+// Type definitions to match Pascal
+using DArray = std::vector<double>;
+using TDArray2D = std::vector<DArray>;
+using TDArray3D = std::vector<TDArray2D>;
+using TDArray4D = std::vector<TDArray3D>;
+using TIntArray = std::vector<int>;
 
-// ========== OpenCL Error Checking ==========
-#define CL_CHECK(err) \
-    do { \
-        if (err != CL_SUCCESS) { \
-            cerr << "OpenCL error at " << __FILE__ << ":" << __LINE__ << " - " << (int)err << endl; \
-            exit(1); \
-        } \
-    } while(0)
-
-// ========== Type Definitions ==========
-enum ActivationType {
+// Enumerations
+enum class TActivationType {
     atSigmoid,
     atTanh,
     atReLU,
     atLinear
 };
 
-enum LossType {
+enum class TLossType {
     ltMSE,
     ltCrossEntropy
 };
 
-enum Command {
+enum class TPaddingType {
+    ptSame,
+    ptValid
+};
+
+enum class TCommand {
     cmdNone,
     cmdCreate,
     cmdTrain,
@@ -75,370 +71,64 @@ enum Command {
     cmdHelp
 };
 
-const int BLOCK_SIZE = 256;
-const char MODEL_MAGIC[] = "CNNOCI01";
+// Data split structure
+struct TDataSplit {
+    TDArray4D TrainInputs;
+    TDArray3D TrainTargets;
+    TDArray4D ValInputs;
+    TDArray3D ValTargets;
+};
 
-// Type aliases matching Pascal
-typedef vector<float> FArray;
-typedef vector<FArray> TFArray2D;
-typedef vector<TFArray2D> TFArray3D;
-typedef vector<TFArray3D> TFArray4D;
-typedef vector<int> TIntArray;
+// Forward declarations
+class TConvFilter;
+class TConvLayer;
+class TPoolingLayer;
+class TFCLayer;
+class TAdvancedCNN;
 
-// ========== OpenCL Kernels ==========
-const char* kernelSource = R"CLC(
-float d_Sigmoid(float x) {
-    float clamped = fmax(-500.0f, fmin(500.0f, x));
-    return 1.0f / (1.0f + exp(-clamped));
-}
-
-float d_DSigmoid(float x) {
-    return x * (1.0f - x);
-}
-
-float d_TanhActivation(float x) {
-    return tanh(x);
-}
-
-float d_DTanh(float x) {
-    return 1.0f - (x * x);
-}
-
-float d_ReLU(float x) {
-    return (x > 0.0f) ? x : 0.0f;
-}
-
-float d_DReLU(float x) {
-    return (x > 0.0f) ? 1.0f : 0.0f;
-}
-
-float d_ApplyActivation(float x, int ActType) {
-    switch (ActType) {
-        case 0: return d_Sigmoid(x);
-        case 1: return d_TanhActivation(x);
-        case 2: return d_ReLU(x);
-        case 3: return x;
-        default: return x;
-    }
-}
-
-float d_ApplyActivationDerivative(float x, int ActType) {
-    switch (ActType) {
-        case 0: return d_DSigmoid(x);
-        case 1: return d_DTanh(x);
-        case 2: return d_DReLU(x);
-        case 3: return 1.0f;
-        default: return 1.0f;
-    }
-}
-
-float d_ClipValue(float V, float MaxVal) {
-    if (V > MaxVal) return MaxVal;
-    else if (V < -MaxVal) return -MaxVal;
-    else return V;
-}
-
-// Convolution kernel forward pass
-__kernel void k_conv_forward(
-    __global float* output,
-    __global float* preActivation,
-    __global const float* input,
-    __global const float* weights,
-    __global const float* bias,
-    int inputChannels, int inputHeight, int inputWidth,
-    int kernelSize, int padding, int stride,
-    int outputChannels, int outputHeight, int outputWidth,
-    int filterIdx) {
-    
-    int outH = get_global_id(0);
-    int outW = get_global_id(1);
-    
-    if (outH < outputHeight && outW < outputWidth) {
-        float sum = bias[filterIdx];
-        
-        for (int c = 0; c < inputChannels; c++) {
-            for (int kh = 0; kh < kernelSize; kh++) {
-                for (int kw = 0; kw < kernelSize; kw++) {
-                    int ih = outH * stride + kh - padding;
-                    int iw = outW * stride + kw - padding;
-                    
-                    if (ih >= 0 && ih < inputHeight && iw >= 0 && iw < inputWidth) {
-                        int inIdx = (c * inputHeight + ih) * inputWidth + iw;
-                        int wIdx = (filterIdx * inputChannels + c) * kernelSize * kernelSize + kh * kernelSize + kw;
-                        sum += input[inIdx] * weights[wIdx];
-                    }
-                }
-            }
-        }
-        
-        int outIdx = (filterIdx * outputHeight + outH) * outputWidth + outW;
-        preActivation[outIdx] = sum;
-        output[outIdx] = d_ApplyActivation(sum, 2);
-    }
-}
-
-// Activation function kernel
-__kernel void k_activate(
-    __global float* output,
-    __global const float* input,
-    int size, int actType) {
-    
-    int i = get_global_id(0);
-    if (i < size) {
-        output[i] = d_ApplyActivation(input[i], actType);
-    }
-}
-
-// Max pooling forward pass
-__kernel void k_pool_forward(
-    __global float* output,
-    __global int* maxIndices,
-    __global const float* input,
-    int inputChannels, int inputHeight, int inputWidth,
-    int poolSize, int stride,
-    int outputHeight, int outputWidth) {
-    
-    int c = get_global_id(0);
-    int h = get_global_id(1);
-    int w = get_global_id(2);
-    
-    if (c < inputChannels && h < outputHeight && w < outputWidth) {
-        float maxVal = -1e38f;
-        int maxIdx = 0;
-        
-        for (int ph = 0; ph < poolSize; ph++) {
-            for (int pw = 0; pw < poolSize; pw++) {
-                int ih = h * stride + ph;
-                int iw = w * stride + pw;
-                int idx = (c * inputHeight + ih) * inputWidth + iw;
-                
-                if (input[idx] > maxVal) {
-                    maxVal = input[idx];
-                    maxIdx = ph * poolSize + pw;
-                }
-            }
-        }
-        
-        int outIdx = (c * outputHeight + h) * outputWidth + w;
-        output[outIdx] = maxVal;
-        maxIndices[outIdx] = maxIdx;
-    }
-}
-
-// Flatten kernel (3D to 1D)
-__kernel void k_flatten(
-    __global float* output,
-    __global const float* input,
-    int channels, int height, int width) {
-    
-    int idx = get_global_id(0);
-    int size = channels * height * width;
-    
-    if (idx < size) {
-        int c = idx / (height * width);
-        int hw = idx % (height * width);
-        int h = hw / width;
-        int w = hw % width;
-        
-        int inIdx = (c * height + h) * width + w;
-        output[idx] = input[inIdx];
-    }
-}
-
-// Fully connected forward pass
-__kernel void k_fc_forward(
-    __global float* output,
-    __global float* preActivation,
-    __global const float* input,
-    __global const float* weights,
-    __global const float* bias,
-    int inputSize, int outputSize, int actType) {
-    
-    int i = get_global_id(0);
-    
-    if (i < outputSize) {
-        float sum = bias[i];
-        for (int j = 0; j < inputSize; j++) {
-            sum += weights[i * inputSize + j] * input[j];
-        }
-        preActivation[i] = sum;
-        output[i] = d_ApplyActivation(sum, actType);
-    }
-}
-
-// Matrix-vector multiply
-__kernel void k_matvec(
-    __global float* y,
-    __global const float* W,
-    __global const float* x,
-    __global const float* b,
-    int rows, int cols) {
-    
-    int i = get_global_id(0);
-    if (i < rows) {
-        float sum = b[i];
-        for (int j = 0; j < cols; j++) {
-            sum += W[i * cols + j] * x[j];
-        }
-        y[i] = sum;
-    }
-}
-
-// Softmax kernel
-__kernel void k_softmax(
-    __global float* output,
-    __global const float* input,
-    int size) {
-    
-    int i = get_global_id(0);
-    
-    if (i == 0) {
-        float maxVal = input[0];
-        for (int j = 1; j < size; j++) {
-            if (input[j] > maxVal) maxVal = input[j];
-        }
-        
-        float sum = 0.0f;
-        for (int j = 0; j < size; j++) {
-            output[j] = exp(input[j] - maxVal);
-            sum += output[j];
-        }
-        
-        for (int j = 0; j < size; j++) {
-            output[j] /= (sum + 1e-15f);
-        }
-    }
-}
-
-// Convolution backward kernel
-__kernel void k_conv_backward_weights(
-    __global float* dWeights,
-    __global float* dBias,
-    __global const float* dOutput,
-    __global const float* input,
-    int inputChannels, int inputHeight, int inputWidth,
-    int kernelSize, int padding, int stride,
-    int outputHeight, int outputWidth,
-    int filterIdx) {
-    
-    int c = get_global_id(0);
-    int kh = get_global_id(1);
-    int kw = get_global_id(2);
-    
-    if (c < inputChannels && kh < kernelSize && kw < kernelSize) {
-        float sum = 0.0f;
-        
-        for (int oh = 0; oh < outputHeight; oh++) {
-            for (int ow = 0; ow < outputWidth; ow++) {
-                int ih = oh * stride + kh - padding;
-                int iw = ow * stride + kw - padding;
-                
-                if (ih >= 0 && ih < inputHeight && iw >= 0 && iw < inputWidth) {
-                    int inIdx = (c * inputHeight + ih) * inputWidth + iw;
-                    int outIdx = (filterIdx * outputHeight + oh) * outputWidth + ow;
-                    sum += dOutput[outIdx] * input[inIdx];
-                }
-            }
-        }
-        
-        int wIdx = (filterIdx * inputChannels + c) * kernelSize * kernelSize + kh * kernelSize + kw;
-        dWeights[wIdx] = sum;
-    }
-}
-
-// Gradient clipping kernel
-__kernel void k_clip_gradients(
-    __global float* gradients,
-    int size, float clipValue) {
-    
-    int i = get_global_id(0);
-    if (i < size) {
-        gradients[i] = d_ClipValue(gradients[i], clipValue);
-    }
-}
-
-// Update weights kernel (SGD)
-__kernel void k_update_weights(
-    __global float* weights,
-    __global const float* gradients,
-    int size, float learningRate) {
-    
-    int i = get_global_id(0);
-    if (i < size) {
-        weights[i] -= learningRate * gradients[i];
-    }
-}
-)CLC";
-
-// ========== OpenCL Context Manager ==========
-class TOpenCLContext {
+// ========== OpenCL Utilities ==========
+class OpenCLContext {
 public:
     cl_platform_id platform;
     cl_device_id device;
     cl_context context;
     cl_command_queue queue;
-    cl_program program;
     
-    map<string, cl_kernel> kernels;
+    OpenCLContext() : context(nullptr), queue(nullptr) {
+        Initialize();
+    }
     
-    TOpenCLContext() {
+    ~OpenCLContext() {
+        if (queue) clReleaseCommandQueue(queue);
+        if (context) clReleaseContext(context);
+    }
+    
+    void Initialize() {
         cl_int err;
-        
-        err = clGetPlatformIDs(1, &platform, nullptr);
-        CL_CHECK(err);
-        
-        err = clGetDeviceIDs(platform, CL_DEVICE_TYPE_GPU, 1, &device, nullptr);
-        if (err != CL_SUCCESS) {
-            err = clGetDeviceIDs(platform, CL_DEVICE_TYPE_CPU, 1, &device, nullptr);
-        }
-        CL_CHECK(err);
-        
+        clGetPlatformIDs(1, &platform, nullptr);
+        clGetDeviceIDs(platform, CL_DEVICE_TYPE_GPU, 1, &device, nullptr);
         context = clCreateContext(nullptr, 1, &device, nullptr, nullptr, &err);
-        CL_CHECK(err);
-        
         queue = clCreateCommandQueue(context, device, 0, &err);
-        CL_CHECK(err);
-        
-        program = clCreateProgramWithSource(context, 1, &kernelSource, nullptr, &err);
-        CL_CHECK(err);
-        
-        err = clBuildProgram(program, 1, &device, nullptr, nullptr, nullptr);
-        if (err != CL_SUCCESS) {
-            size_t len;
-            clGetProgramBuildInfo(program, device, CL_PROGRAM_BUILD_LOG, 0, nullptr, &len);
-            char* log = new char[len];
-            clGetProgramBuildInfo(program, device, CL_PROGRAM_BUILD_LOG, len, log, nullptr);
-            cerr << "Kernel build error:\n" << log << endl;
-            delete[] log;
-            exit(1);
-        }
-    }
-    
-    ~TOpenCLContext() {
-        for (auto& kv : kernels) {
-            clReleaseKernel(kv.second);
-        }
-        clReleaseProgram(program);
-        clReleaseCommandQueue(queue);
-        clReleaseContext(context);
-    }
-    
-    cl_kernel GetKernel(const string& name) {
-        if (kernels.find(name) == kernels.end()) {
-            cl_int err;
-            kernels[name] = clCreateKernel(program, name.c_str(), &err);
-            CL_CHECK(err);
-        }
-        return kernels[name];
     }
 };
 
+static OpenCLContext gOpenCLContext;
+
 // ========== Utility Functions ==========
-double RandomWeight(double Scale) {
-    return (rand() / (double)RAND_MAX - 0.5) * 2.0 * Scale;
+inline double ClipValue(double V, double MaxVal) {
+    if (V > MaxVal) return MaxVal;
+    else if (V < -MaxVal) return -MaxVal;
+    else return V;
 }
 
-void InitMatrixF(TFArray2D& M, int Rows, int Cols, double Scale) {
+inline double RandomWeight(double Scale) {
+    static std::random_device rd;
+    static std::mt19937 gen(rd());
+    static std::uniform_real_distribution<> dis(-1.0, 1.0);
+    return dis(gen) * Scale;
+}
+
+inline void InitMatrix(TDArray2D& M, int Rows, int Cols, double Scale) {
     M.resize(Rows);
     for (int i = 0; i < Rows; i++) {
         M[i].resize(Cols);
@@ -448,37 +138,37 @@ void InitMatrixF(TFArray2D& M, int Rows, int Cols, double Scale) {
     }
 }
 
-void ZeroMatrixF(TFArray2D& M, int Rows, int Cols) {
+inline void ZeroMatrix(TDArray2D& M, int Rows, int Cols) {
     M.resize(Rows);
     for (int i = 0; i < Rows; i++) {
         M[i].resize(Cols);
         for (int j = 0; j < Cols; j++) {
-            M[i][j] = 0.0f;
+            M[i][j] = 0.0;
         }
     }
 }
 
-void ZeroArrayF(FArray& A, int Size) {
+inline void ZeroArray(DArray& A, int Size) {
     A.resize(Size);
     for (int i = 0; i < Size; i++) {
-        A[i] = 0.0f;
+        A[i] = 0.0;
     }
 }
 
-void Zero3DArrayF(TFArray3D& A, int D1, int D2, int D3) {
+inline void Zero3DArray(TDArray3D& A, int D1, int D2, int D3) {
     A.resize(D1);
     for (int i = 0; i < D1; i++) {
         A[i].resize(D2);
         for (int j = 0; j < D2; j++) {
             A[i][j].resize(D3);
             for (int k = 0; k < D3; k++) {
-                A[i][j][k] = 0.0f;
+                A[i][j][k] = 0.0;
             }
         }
     }
 }
 
-void Zero4DArrayF(TFArray4D& A, int D1, int D2, int D3, int D4) {
+inline void Zero4DArray(TDArray4D& A, int D1, int D2, int D3, int D4) {
     A.resize(D1);
     for (int i = 0; i < D1; i++) {
         A[i].resize(D2);
@@ -487,344 +177,405 @@ void Zero4DArrayF(TFArray4D& A, int D1, int D2, int D3, int D4) {
             for (int k = 0; k < D3; k++) {
                 A[i][j][k].resize(D4);
                 for (int l = 0; l < D4; l++) {
-                    A[i][j][k][l] = 0.0f;
+                    A[i][j][k][l] = 0.0;
                 }
             }
         }
     }
 }
 
-// ========== Helper Functions ==========
-string ActivationToStr(ActivationType act) {
-    switch (act) {
-        case atSigmoid: return "sigmoid";
-        case atTanh: return "tanh";
-        case atReLU: return "relu";
-        case atLinear: return "linear";
-        default: return "sigmoid";
-    }
-}
-
-string LossToStr(LossType loss) {
-    switch (loss) {
-        case ltMSE: return "mse";
-        case ltCrossEntropy: return "crossentropy";
-        default: return "mse";
-    }
-}
-
-ActivationType ParseActivation(const string& s) {
-    string lower = s;
-    transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
-    if (lower == "tanh") return atTanh;
-    else if (lower == "relu") return atReLU;
-    else if (lower == "linear") return atLinear;
-    else return atSigmoid;
-}
-
-LossType ParseLoss(const string& s) {
-    string lower = s;
-    transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
-    if (lower == "crossentropy") return ltCrossEntropy;
-    else return ltMSE;
-}
-
-void ParseIntArrayHelper(const string& s, TIntArray& result) {
-    result.clear();
-    stringstream ss(s);
-    string token;
-    while (getline(ss, token, ',')) {
-        token.erase(0, token.find_first_not_of(" \t\r\n"));
-        token.erase(token.find_last_not_of(" \t\r\n") + 1);
-        if (!token.empty()) {
-            result.push_back(stoi(token));
-        }
-    }
-}
-
-void PrintUsage() {
-    std::cout << "\n=================================================================\n";
-    std::cout << "  CNN - Convolutional Neural Network (OpenCL)\n";
-    std::cout << "=================================================================\n\n";
-    std::cout << "USAGE:\n";
-    std::cout << "  cnn_opencl <command> [options]\n\n";
-    std::cout << "COMMANDS:\n";
-    std::cout << "  help                 Show this help message\n";
-    std::cout << "  info <model.json>    Display model architecture information\n";
-    std::cout << "  create <config>      Create and save a new model\n";
-    std::cout << "  train <config>       Train a model\n";
-    std::cout << "  predict <config>     Run prediction on input data\n\n";
-    std::cout << "EXAMPLES:\n";
-    std::cout << "  cnn_opencl help\n";
-    std::cout << "  cnn_opencl info model.json\n";
-    std::cout << "  cnn_opencl create --model model.json --input 28,28,1 --conv 16,32 --kernels 3,3 --pool 2,2 --fc 128 --output 10\n";
-    std::cout << "  cnn_opencl train --model model.json --data train.json --epochs 10 --batch 32 --lr 0.001\n";
-    std::cout << "  cnn_opencl predict --model model.json --input image.json\n\n";
-    std::cout << "OPTIONS:\n";
-    std::cout << "  --model <file>       Model file path (JSON)\n";
-    std::cout << "  --input <W,H,C>      Input dimensions (width,height,channels)\n";
-    std::cout << "  --conv <F1,F2,...>   Convolutional filter counts per layer\n";
-    std::cout << "  --kernels <K1,K2>    Kernel sizes per conv layer\n";
-    std::cout << "  --pool <P1,P2>       Pooling sizes per layer\n";
-    std::cout << "  --fc <N1,N2,...>     Fully connected layer sizes\n";
-    std::cout << "  --output <N>         Output size (number of classes)\n";
-    std::cout << "  --activation <type>  Activation function:  sigmoid, tanh, relu, linear (default: relu)\n";
-    std::cout << "  --loss <type>        Loss function: mse, crossentropy (default: crossentropy)\n";
-    std::cout << "  --lr <rate>          Learning rate (default: 0.001)\n";
-    std::cout << "  --clip <value>       Gradient clipping value (default: 5.0)\n";
-    std::cout << "  --data <file>        Training/test data file (JSON)\n";
-    std::cout << "  --epochs <N>         Number of training epochs\n";
-    std::cout << "  --batch <N>          Batch size for training\n";
-    std::cout << "  --validation <rate>  Validation split ratio (default: 0.2)\n\n";
-}
-
-// ========== Convolutional Filter ==========
-class TConvFilter {
+// ========== TActivation Class ==========
+class TActivation {
 public:
-    int FInputChannels, FOutputChannels, FKernelSize;
-    TFArray4D Weights;
-    TFArray4D dWeights;
-    float Bias;
-    float dBias;
-    
-    cl_mem gpu_weights, gpu_dweights, gpu_bias, gpu_dbias;
-    
-    TConvFilter(int InputChannels, int OutputChannels, int KernelSize, TOpenCLContext* oclCtx) {
-        FInputChannels = InputChannels;
-        FOutputChannels = OutputChannels;
-        FKernelSize = KernelSize;
-        double Scale = sqrt(2.0 / (InputChannels * KernelSize * KernelSize));
-        
-        Zero4DArrayF(Weights, 1, InputChannels, KernelSize, KernelSize);
-        Zero4DArrayF(dWeights, 1, InputChannels, KernelSize, KernelSize);
-        
-        for (int j = 0; j < InputChannels; j++) {
-            for (int k = 0; k < KernelSize; k++) {
-                for (int l = 0; l < KernelSize; l++) {
-                    Weights[0][j][k][l] = RandomWeight(Scale);
-                }
-            }
+    static double Apply(double X, TActivationType ActType) {
+        switch (ActType) {
+            case TActivationType::atSigmoid:
+                return 1.0 / (1.0 + std::exp(-std::max(-500.0, std::min(500.0, X))));
+            case TActivationType::atTanh:
+                return std::tanh(X);
+            case TActivationType::atReLU:
+                return (X > 0) ? X : 0;
+            case TActivationType::atLinear:
+                return X;
+            default:
+                return X;
         }
-        
-        Bias = 0.0f;
-        dBias = 0.0f;
-        
-        // Allocate GPU memory
-        cl_int err;
-        int wsize = InputChannels * KernelSize * KernelSize;
-        FArray flatWeights(wsize);
-        int idx = 0;
-        for (int j = 0; j < InputChannels; j++) {
-            for (int k = 0; k < KernelSize; k++) {
-                for (int l = 0; l < KernelSize; l++) {
-                    flatWeights[idx++] = Weights[0][j][k][l];
-                }
-            }
-        }
-        
-        gpu_weights = clCreateBuffer(oclCtx->context, CL_MEM_READ_WRITE | CL_MEM_COPY_HOST_PTR,
-                                     sizeof(float) * wsize, flatWeights.data(), &err);
-        CL_CHECK(err);
-        
-        gpu_dweights = clCreateBuffer(oclCtx->context, CL_MEM_READ_WRITE,
-                                      sizeof(float) * wsize, nullptr, &err);
-        CL_CHECK(err);
-        
-        gpu_bias = clCreateBuffer(oclCtx->context, CL_MEM_READ_WRITE | CL_MEM_COPY_HOST_PTR,
-                                  sizeof(float), &Bias, &err);
-        CL_CHECK(err);
-        
-        gpu_dbias = clCreateBuffer(oclCtx->context, CL_MEM_READ_WRITE,
-                                   sizeof(float), nullptr, &err);
-        CL_CHECK(err);
     }
-    
-    ~TConvFilter() {
-        clReleaseMemObject(gpu_weights);
-        clReleaseMemObject(gpu_dweights);
-        clReleaseMemObject(gpu_bias);
-        clReleaseMemObject(gpu_dbias);
-    }
-    
-    void ResetGradients() {
-        for (size_t j = 0; j < dWeights[0].size(); j++) {
-            for (size_t k = 0; k < dWeights[0][j].size(); k++) {
-                for (size_t l = 0; l < dWeights[0][j][k].size(); l++) {
-                    dWeights[0][j][k][l] = 0.0f;
-                }
-            }
+
+    static double Derivative(double Y, TActivationType ActType) {
+        switch (ActType) {
+            case TActivationType::atSigmoid:
+                return Y * (1.0 - Y);
+            case TActivationType::atTanh:
+                return 1.0 - Y * Y;
+            case TActivationType::atReLU:
+                return (Y > 0) ? 1.0 : 0.0;
+            case TActivationType::atLinear:
+                return 1.0;
+            default:
+                return 1.0;
         }
-        dBias = 0.0f;
+    }
+
+    static void ApplySoftmax(DArray& Arr) {
+        double MaxVal = Arr[0];
+        for (size_t i = 1; i < Arr.size(); i++) {
+            if (Arr[i] > MaxVal) MaxVal = Arr[i];
+        }
+
+        double Sum = 0;
+        for (size_t i = 0; i < Arr.size(); i++) {
+            Arr[i] = std::exp(Arr[i] - MaxVal);
+            Sum += Arr[i];
+        }
+
+        for (size_t i = 0; i < Arr.size(); i++) {
+            Arr[i] = Arr[i] / Sum;
+        }
     }
 };
 
-// ========== Convolutional Layer ==========
-class TConvLayer {
-private:
-    int FInputChannels, FOutputChannels, FKernelSize, FStride, FPadding;
-    ActivationType FActivation;
-    
+#endif // CNN_OPENCL_H
+
+// ========== TLoss Class ==========
+class TLoss {
 public:
-    vector<TConvFilter*> Filters;
-    TFArray3D InputCache;
-    TFArray3D OutputCache;
-    TFArray3D PreActivation;
+    static double Compute(const DArray& Pred, const DArray& Target, TLossType LossType) {
+        double Result = 0;
+
+        switch (LossType) {
+            case TLossType::ltMSE:
+                for (size_t i = 0; i < Pred.size(); i++) {
+                    Result += (Pred[i] - Target[i]) * (Pred[i] - Target[i]);
+                }
+                break;
+
+            case TLossType::ltCrossEntropy:
+                for (size_t i = 0; i < Pred.size(); i++) {
+                    double P = std::max(1e-15, std::min(1.0 - 1e-15, Pred[i]));
+                    Result += -(Target[i] * std::log(P) + (1.0 - Target[i]) * std::log(1.0 - P));
+                }
+                break;
+        }
+
+        return Result / Pred.size();
+    }
+
+    static void Gradient(const DArray& Pred, const DArray& Target, TLossType LossType, DArray& Grad) {
+        Grad.resize(Pred.size());
+
+        switch (LossType) {
+            case TLossType::ltMSE:
+                for (size_t i = 0; i < Pred.size(); i++) {
+                    Grad[i] = Pred[i] - Target[i];
+                }
+                break;
+
+            case TLossType::ltCrossEntropy:
+                for (size_t i = 0; i < Pred.size(); i++) {
+                    double P = std::max(1e-15, std::min(1.0 - 1e-15, Pred[i]));
+                    Grad[i] = (P - Target[i]) / (P * (1.0 - P) + 1e-15);
+                }
+                break;
+        }
+    }
+};
+
+// ========== TConvFilter Class ==========
+class TConvFilter {
+private:
+    int FInputChannels;
+    int FOutputChannels;
+    int FKernelSize;
+
+public:
+    TDArray4D Weights;
+    double Bias;
+    TDArray4D dWeights;
+    double dBias;
     
-    cl_mem gpu_input, gpu_output, gpu_preact;
-    TOpenCLContext* oclCtx;
-    
-    TConvLayer(int InputChannels, int OutputChannels, int KernelSize, int Stride, int Padding,
-               ActivationType Activation, TOpenCLContext* OclCtx) {
-        FInputChannels = InputChannels;
-        FOutputChannels = OutputChannels;
-        FKernelSize = KernelSize;
-        FStride = Stride;
-        FPadding = Padding;
-        FActivation = Activation;
-        oclCtx = OclCtx;
-        
-        gpu_input = nullptr;
-        gpu_output = nullptr;
-        gpu_preact = nullptr;
-        
-        Filters.resize(OutputChannels);
+    cl_mem WeightsBuffer;
+    cl_mem dWeightsBuffer;
+
+    TConvFilter(int InputChannels, int OutputChannels, int KernelSize)
+        : FInputChannels(InputChannels),
+          FOutputChannels(OutputChannels),
+          FKernelSize(KernelSize),
+          Bias(0.0),
+          dBias(0.0),
+          WeightsBuffer(nullptr),
+          dWeightsBuffer(nullptr) {
+
+        double Scale = std::sqrt(2.0 / (InputChannels * KernelSize * KernelSize));
+
+        Zero4DArray(Weights, OutputChannels, InputChannels, KernelSize, KernelSize);
+        Zero4DArray(dWeights, OutputChannels, InputChannels, KernelSize, KernelSize);
+
+        // Initialize weights with random values
         for (int i = 0; i < OutputChannels; i++) {
-            Filters[i] = new TConvFilter(InputChannels, 1, KernelSize, OclCtx);
-        }
-    }
-    
-    ~TConvLayer() {
-        for (auto& f : Filters) {
-            delete f;
-        }
-        Filters.clear();
-        if (gpu_input) clReleaseMemObject(gpu_input);
-        if (gpu_output) clReleaseMemObject(gpu_output);
-        if (gpu_preact) clReleaseMemObject(gpu_preact);
-    }
-    
-    TFArray3D Pad3D(const TFArray3D& Input, int Padding) {
-        TFArray3D Result;
-        if (Padding == 0) {
-            return Input;
-        }
-        
-        int newH = Input[0].size() + 2 * Padding;
-        int newW = Input[0][0].size() + 2 * Padding;
-        Zero3DArrayF(Result, Input.size(), newH, newW);
-        
-        for (size_t c = 0; c < Input.size(); c++) {
-            for (int h = 0; h < newH; h++) {
-                for (int w = 0; w < newW; w++) {
-                    int SrcH = h - Padding;
-                    int SrcW = w - Padding;
-                    if (SrcH >= 0 && SrcH < (int)Input[c].size() &&
-                        SrcW >= 0 && SrcW < (int)Input[c][0].size()) {
-                        Result[c][h][w] = Input[c][SrcH][SrcW];
-                    } else {
-                        Result[c][h][w] = 0;
+            for (int j = 0; j < InputChannels; j++) {
+                for (int k = 0; k < KernelSize; k++) {
+                    for (int l = 0; l < KernelSize; l++) {
+                        Weights[i][j][k][l] = RandomWeight(Scale);
                     }
                 }
             }
         }
+        
+        AllocateGPUBuffers();
+    }
+    
+    ~TConvFilter() {
+        if (WeightsBuffer) clReleaseMemObject(WeightsBuffer);
+        if (dWeightsBuffer) clReleaseMemObject(dWeightsBuffer);
+    }
+    
+    void AllocateGPUBuffers() {
+        cl_int err;
+        size_t weightsSize = Weights.size() * Weights[0].size() * 
+                            Weights[0][0].size() * Weights[0][0][0].size() * sizeof(double);
+        
+        WeightsBuffer = clCreateBuffer(gOpenCLContext.context, CL_MEM_READ_WRITE, 
+                                      weightsSize, nullptr, &err);
+        dWeightsBuffer = clCreateBuffer(gOpenCLContext.context, CL_MEM_READ_WRITE,
+                                       weightsSize, nullptr, &err);
+    }
+    
+    void CopyWeightsToGPU() {
+        std::vector<double> flatWeights;
+        for (size_t i = 0; i < Weights.size(); i++) {
+            for (size_t j = 0; j < Weights[i].size(); j++) {
+                for (size_t k = 0; k < Weights[i][j].size(); k++) {
+                    for (size_t l = 0; l < Weights[i][j][k].size(); l++) {
+                        flatWeights.push_back(Weights[i][j][k][l]);
+                    }
+                }
+            }
+        }
+        clEnqueueWriteBuffer(gOpenCLContext.queue, WeightsBuffer, CL_TRUE, 0,
+                           flatWeights.size() * sizeof(double), flatWeights.data(), 0, nullptr, nullptr);
+    }
+    
+    void CopyWeightsFromGPU() {
+        std::vector<double> flatWeights(Weights.size() * Weights[0].size() * 
+                                       Weights[0][0].size() * Weights[0][0][0].size());
+        clEnqueueReadBuffer(gOpenCLContext.queue, WeightsBuffer, CL_TRUE, 0,
+                          flatWeights.size() * sizeof(double), flatWeights.data(), 0, nullptr, nullptr);
+        
+        size_t idx = 0;
+        for (size_t i = 0; i < Weights.size(); i++) {
+            for (size_t j = 0; j < Weights[i].size(); j++) {
+                for (size_t k = 0; k < Weights[i][j].size(); k++) {
+                    for (size_t l = 0; l < Weights[i][j][k].size(); l++) {
+                        Weights[i][j][k][l] = flatWeights[idx++];
+                    }
+                }
+            }
+        }
+    }
+
+    void ResetGradients() {
+        for (size_t i = 0; i < dWeights.size(); i++) {
+            for (size_t j = 0; j < dWeights[i].size(); j++) {
+                for (size_t k = 0; k < dWeights[i][j].size(); k++) {
+                    for (size_t l = 0; l < dWeights[i][j][k].size(); l++) {
+                        dWeights[i][j][k][l] = 0.0;
+                    }
+                }
+            }
+        }
+        dBias = 0.0;
+    }
+};
+
+// ========== TConvLayer Class ==========
+class TConvLayer {
+private:
+    int FInputChannels;
+    int FOutputChannels;
+    int FKernelSize;
+    int FStride;
+    int FPadding;
+    TActivationType FActivation;
+
+    TDArray3D Pad3D(const TDArray3D& Input, int Padding) {
+        if (Padding == 0) {
+            return Input;
+        }
+
+        int Channels = Input.size();
+        int Height = Input[0].size();
+        int Width = Input[0][0].size();
+        int NewHeight = Height + 2 * Padding;
+        int NewWidth = Width + 2 * Padding;
+
+        TDArray3D Result;
+        Result.resize(Channels);
+        for (int c = 0; c < Channels; c++) {
+            Result[c].resize(NewHeight);
+            for (int h = 0; h < NewHeight; h++) {
+                Result[c][h].resize(NewWidth);
+                for (int w = 0; w < NewWidth; w++) {
+                    int SrcH = h - Padding;
+                    int SrcW = w - Padding;
+                    if (SrcH >= 0 && SrcH < Height && SrcW >= 0 && SrcW < Width) {
+                        Result[c][h][w] = Input[c][SrcH][SrcW];
+                    } else {
+                        Result[c][h][w] = 0.0;
+                    }
+                }
+            }
+        }
+
         return Result;
     }
+
+public:
+    std::vector<TConvFilter*> Filters;
+    TDArray3D InputCache;
+    TDArray3D OutputCache;
+    TDArray3D PreActivation;
     
-    void Forward(const TFArray3D& Input, TFArray3D& Output) {
+    cl_mem InputBuffer;
+    cl_mem OutputBuffer;
+    cl_mem PreActivationBuffer;
+
+    TConvLayer(int InputChannels, int OutputChannels, int KernelSize,
+               int Stride, int Padding, TActivationType Activation)
+        : FInputChannels(InputChannels),
+          FOutputChannels(OutputChannels),
+          FKernelSize(KernelSize),
+          FStride(Stride),
+          FPadding(Padding),
+          FActivation(Activation),
+          InputBuffer(nullptr),
+          OutputBuffer(nullptr),
+          PreActivationBuffer(nullptr) {
+
+        Filters.resize(OutputChannels);
+        for (int i = 0; i < OutputChannels; i++) {
+            Filters[i] = new TConvFilter(InputChannels, 1, KernelSize);
+        }
+    }
+
+    ~TConvLayer() {
+        for (size_t i = 0; i < Filters.size(); i++) {
+            delete Filters[i];
+        }
+        if (InputBuffer) clReleaseMemObject(InputBuffer);
+        if (OutputBuffer) clReleaseMemObject(OutputBuffer);
+        if (PreActivationBuffer) clReleaseMemObject(PreActivationBuffer);
+    }
+
+    void Forward(const TDArray3D& Input, TDArray3D& Output) {
         InputCache = Input;
-        
-        TFArray3D Padded = FPadding > 0 ? Pad3D(Input, FPadding) : Input;
-        
+
+        TDArray3D Padded;
+        if (FPadding > 0) {
+            Padded = Pad3D(Input, FPadding);
+        } else {
+            Padded = Input;
+        }
+
         int outH = (Padded[0].size() - FKernelSize) / FStride + 1;
         int outW = (Padded[0][0].size() - FKernelSize) / FStride + 1;
-        
-        Zero3DArrayF(Output, FOutputChannels, outH, outW);
-        Zero3DArrayF(PreActivation, FOutputChannels, outH, outW);
-        
-        // Flatten padded input for GPU
-        int padSize = Padded.size() * Padded[0].size() * Padded[0][0].size();
-        FArray flatInput(padSize);
-        int idx = 0;
-        for (size_t c = 0; c < Padded.size(); c++) {
-            for (size_t h = 0; h < Padded[c].size(); h++) {
-                for (size_t w = 0; w < Padded[c][h].size(); w++) {
-                    flatInput[idx++] = Padded[c][h][w];
-                }
-            }
-        }
-        
-        cl_int err;
-        if (gpu_input) clReleaseMemObject(gpu_input);
-        gpu_input = clCreateBuffer(oclCtx->context, CL_MEM_READ_WRITE | CL_MEM_COPY_HOST_PTR,
-                                   sizeof(float) * flatInput.size(), flatInput.data(), &err);
-        CL_CHECK(err);
-        
-        int outSize = FOutputChannels * outH * outW;
-        if (gpu_output) clReleaseMemObject(gpu_output);
-        gpu_output = clCreateBuffer(oclCtx->context, CL_MEM_READ_WRITE,
-                                    sizeof(float) * outSize, nullptr, &err);
-        CL_CHECK(err);
-        
-        if (gpu_preact) clReleaseMemObject(gpu_preact);
-        gpu_preact = clCreateBuffer(oclCtx->context, CL_MEM_READ_WRITE,
-                                    sizeof(float) * outSize, nullptr, &err);
-        CL_CHECK(err);
-        
-        // Run convolution for each filter on GPU
+
+        Zero3DArray(Output, FOutputChannels, outH, outW);
+        Zero3DArray(PreActivation, FOutputChannels, outH, outW);
+
+        // CPU fallback for convolution (can be optimized with custom OpenCL kernels)
         for (int f = 0; f < FOutputChannels; f++) {
-            cl_kernel kern = oclCtx->GetKernel("k_conv_forward");
+            Filters[f]->CopyWeightsToGPU();
             
-            int padH = Padded[0].size();
-            int padW = Padded[0][0].size();
-            
-            err = clSetKernelArg(kern, 0, sizeof(cl_mem), &gpu_output);
-            err |= clSetKernelArg(kern, 1, sizeof(cl_mem), &gpu_preact);
-            err |= clSetKernelArg(kern, 2, sizeof(cl_mem), &gpu_input);
-            err |= clSetKernelArg(kern, 3, sizeof(cl_mem), &Filters[f]->gpu_weights);
-            err |= clSetKernelArg(kern, 4, sizeof(cl_mem), &Filters[f]->gpu_bias);
-            err |= clSetKernelArg(kern, 5, sizeof(int), &FInputChannels);
-            err |= clSetKernelArg(kern, 6, sizeof(int), &padH);
-            err |= clSetKernelArg(kern, 7, sizeof(int), &padW);
-            err |= clSetKernelArg(kern, 8, sizeof(int), &FKernelSize);
-            err |= clSetKernelArg(kern, 9, sizeof(int), &FPadding);
-            err |= clSetKernelArg(kern, 10, sizeof(int), &FStride);
-            err |= clSetKernelArg(kern, 11, sizeof(int), &FOutputChannels);
-            err |= clSetKernelArg(kern, 12, sizeof(int), &outH);
-            err |= clSetKernelArg(kern, 13, sizeof(int), &outW);
-            err |= clSetKernelArg(kern, 14, sizeof(int), &f);
-            CL_CHECK(err);
-            
-            size_t globalSize[2] = {(size_t)outH, (size_t)outW};
-            err = clEnqueueNDRangeKernel(oclCtx->queue, kern, 2, nullptr, globalSize, nullptr, 0, nullptr, nullptr);
-            CL_CHECK(err);
-        }
-        
-        clFinish(oclCtx->queue);
-        
-        // Read output back to host
-        FArray flatOutput(outSize);
-        err = clEnqueueReadBuffer(oclCtx->queue, gpu_output, CL_TRUE, 0, sizeof(float) * outSize, flatOutput.data(), 0, nullptr, nullptr);
-        CL_CHECK(err);
-        
-        idx = 0;
-        for (int f = 0; f < FOutputChannels; f++) {
             for (int h = 0; h < outH; h++) {
                 for (int w = 0; w < outW; w++) {
-                    Output[f][h][w] = flatOutput[idx++];
+                    double Sum = Filters[f]->Bias;
+
+                    for (int c = 0; c < FInputChannels; c++) {
+                        for (int kh = 0; kh < FKernelSize; kh++) {
+                            for (int kw = 0; kw < FKernelSize; kw++) {
+                                int ih = h * FStride + kh;
+                                int iw = w * FStride + kw;
+                                Sum += Padded[c][ih][iw] * Filters[f]->Weights[0][c][kh][kw];
+                            }
+                        }
+                    }
+
+                    PreActivation[f][h][w] = Sum;
+                    Output[f][h][w] = TActivation::Apply(Sum, FActivation);
                 }
             }
         }
-        
+
         OutputCache = Output;
     }
-    
-    void Backward(const TFArray3D& dOutput, TFArray3D& dInput) {
-        // Simple implementation - gradient computation on host
-        int outH = dOutput[0].size();
-        int outW = dOutput[0][0].size();
-        
-        Zero3DArrayF(dInput, FInputChannels, InputCache[0].size(), InputCache[0][0].size());
-        
+
+    void Backward(const TDArray3D& dOutput, TDArray3D& dInput);
+    void ApplyGradients(double LR, double ClipVal);
+    void ResetGradients();
+    int GetOutputChannels();
+};
+
+// ========== TConvLayer Class (continued) ==========
+
+void TConvLayer::Backward(const TDArray3D& dOutput, TDArray3D& dInput) {
+    int outH = dOutput[0].size();
+    int outW = dOutput[0][0].size();
+
+    TDArray3D dH;
+    Zero3DArray(dH, FOutputChannels, outH, outW);
+
+    // Compute activation derivatives
+    for (int f = 0; f < FOutputChannels; f++) {
+        for (int h = 0; h < outH; h++) {
+            for (int w = 0; w < outW; w++) {
+                dH[f][h][w] = dOutput[f][h][w] *
+                              TActivation::Derivative(OutputCache[f][h][w], FActivation);
+            }
+        }
+    }
+
+    // Compute bias gradients
+    for (int f = 0; f < FOutputChannels; f++) {
+        double Sum = 0.0;
+        for (int h = 0; h < outH; h++) {
+            for (int w = 0; w < outW; w++) {
+                Sum += dH[f][h][w];
+            }
+        }
+        Filters[f]->dBias = Sum;
+    }
+
+    // Compute weight gradients
+    for (int f = 0; f < FOutputChannels; f++) {
+        for (int c = 0; c < FInputChannels; c++) {
+            for (int kh = 0; kh < FKernelSize; kh++) {
+                for (int kw = 0; kw < FKernelSize; kw++) {
+                    double Sum = 0.0;
+
+                    for (int h = 0; h < outH; h++) {
+                        for (int w = 0; w < outW; w++) {
+                            int ih = h * FStride + kh;
+                            int iw = w * FStride + kw;
+
+                            if (FPadding > 0) {
+                                Sum += dH[f][h][w] * InputCache[c][ih - FPadding][iw - FPadding];
+                            } else {
+                                Sum += dH[f][h][w] * InputCache[c][ih][iw];
+                            }
+                        }
+                    }
+
+                    Filters[f]->dWeights[0][c][kh][kw] = Sum;
+                }
+            }
+        }
+    }
+
+    // Compute input gradients
+    if (InputCache.size() > 0) {
+        Zero3DArray(dInput, FInputChannels, InputCache[0].size(), InputCache[0][0].size());
+
         for (int f = 0; f < FOutputChannels; f++) {
             for (int h = 0; h < outH; h++) {
                 for (int w = 0; w < outW; w++) {
@@ -833,10 +584,11 @@ public:
                             for (int kw = 0; kw < FKernelSize; kw++) {
                                 int ih = h * FStride + kh;
                                 int iw = w * FStride + kw;
+
                                 if (ih >= 0 && ih < (int)dInput[c].size() &&
                                     iw >= 0 && iw < (int)dInput[c][0].size()) {
-                                    dInput[c][ih][iw] += dOutput[f][h][w] * 
-                                                        Filters[f]->Weights[0][c][kh][kw];
+                                    dInput[c][ih][iw] += dH[f][h][w] *
+                                                         Filters[f]->Weights[0][c][kh][kw];
                                 }
                             }
                         }
@@ -845,63 +597,94 @@ public:
             }
         }
     }
-    
-    void ApplyGradients(double LR, double ClipVal) {
-        for (int f = 0; f < FOutputChannels; f++) {
-            Filters[f]->Bias -= LR * ClipVal;
-            for (size_t i = 0; i < Filters[f]->Weights[0].size(); i++) {
-                for (size_t j = 0; j < Filters[f]->Weights[0][i].size(); j++) {
-                    for (size_t k = 0; k < Filters[f]->Weights[0][i][j].size(); k++) {
-                        Filters[f]->Weights[0][i][j][k] -= LR * Filters[f]->dWeights[0][i][j][k];
-                    }
+}
+
+void TConvLayer::ApplyGradients(double LR, double ClipVal) {
+    for (int f = 0; f < FOutputChannels; f++) {
+        Filters[f]->Bias -= LR * ClipValue(Filters[f]->dBias, ClipVal);
+
+        for (size_t i = 0; i < Filters[f]->Weights[0].size(); i++) {
+            for (size_t j = 0; j < Filters[f]->Weights[0][i].size(); j++) {
+                for (size_t k = 0; k < Filters[f]->Weights[0][i][j].size(); k++) {
+                    Filters[f]->Weights[0][i][j][k] -=
+                        LR * ClipValue(Filters[f]->dWeights[0][i][j][k], ClipVal);
                 }
             }
         }
     }
-    
-    void ResetGradients() {
-        for (int i = 0; i < FOutputChannels; i++) {
-            Filters[i]->ResetGradients();
-        }
-    }
-    
-    int GetOutputChannels() const {
-        return FOutputChannels;
-    }
-};
+}
 
-// ========== Pooling Layer ==========
+void TConvLayer::ResetGradients() {
+    for (int i = 0; i < FOutputChannels; i++) {
+        Filters[i]->ResetGradients();
+    }
+}
+
+int TConvLayer::GetOutputChannels() {
+    return FOutputChannels;
+}
+
+// ========== TPoolingLayer Class ==========
 class TPoolingLayer {
 private:
-    int FPoolSize, FStride;
-    
+    int FPoolSize;
+    int FStride;
+
+    struct MaxIndex {
+        int X;
+        int Y;
+    };
+
 public:
-    TFArray3D InputCache;
-    TFArray3D OutputCache;
-    vector<vector<vector<pair<int,int>>>> MaxIndices;
+    TDArray3D InputCache;
+    TDArray3D OutputCache;
+    std::vector<std::vector<std::vector<MaxIndex>>> MaxIndices;
     
-    TPoolingLayer(int PoolSize, int Stride) {
-        FPoolSize = PoolSize;
-        FStride = Stride;
+    cl_mem InputBuffer;
+    cl_mem OutputBuffer;
+
+    TPoolingLayer(int PoolSize, int Stride)
+        : FPoolSize(PoolSize),
+          FStride(Stride),
+          InputBuffer(nullptr),
+          OutputBuffer(nullptr) {
     }
     
-    void Forward(const TFArray3D& Input, TFArray3D& Output) {
+    ~TPoolingLayer() {
+        if (InputBuffer) clReleaseMemObject(InputBuffer);
+        if (OutputBuffer) clReleaseMemObject(OutputBuffer);
+    }
+
+    void Forward(const TDArray3D& Input, TDArray3D& Output) {
         InputCache = Input;
+
+        int Channels = Input.size();
         int outH = (Input[0].size() - FPoolSize) / FStride + 1;
         int outW = (Input[0][0].size() - FPoolSize) / FStride + 1;
-        
-        Zero3DArrayF(Output, Input.size(), outH, outW);
-        MaxIndices.assign(Input.size(), vector<vector<pair<int,int>>>(outH, vector<pair<int,int>>(outW)));
-        
-        for (size_t c = 0; c < Input.size(); c++) {
+
+        Zero3DArray(Output, Channels, outH, outW);
+
+        // Resize MaxIndices
+        MaxIndices.resize(Channels);
+        for (int c = 0; c < Channels; c++) {
+            MaxIndices[c].resize(outH);
+            for (int h = 0; h < outH; h++) {
+                MaxIndices[c][h].resize(outW);
+            }
+        }
+
+        for (int c = 0; c < Channels; c++) {
             for (int h = 0; h < outH; h++) {
                 for (int w = 0; w < outW; w++) {
-                    float MaxVal = -1e38f;
-                    int MaxH = 0, MaxW = 0;
+                    double MaxVal = -1e308;
+                    int MaxH = 0;
+                    int MaxW = 0;
+
                     for (int kh = 0; kh < FPoolSize; kh++) {
                         for (int kw = 0; kw < FPoolSize; kw++) {
                             int ph = h * FStride + kh;
                             int pw = w * FStride + kw;
+
                             if (Input[c][ph][pw] > MaxVal) {
                                 MaxVal = Input[c][ph][pw];
                                 MaxH = kh;
@@ -909,22 +692,29 @@ public:
                             }
                         }
                     }
+
                     Output[c][h][w] = MaxVal;
-                    MaxIndices[c][h][w] = make_pair(MaxW, MaxH);
+                    MaxIndices[c][h][w].X = MaxW;
+                    MaxIndices[c][h][w].Y = MaxH;
                 }
             }
         }
+
         OutputCache = Output;
     }
-    
-    void Backward(const TFArray3D& dOutput, TFArray3D& dInput) {
-        Zero3DArrayF(dInput, InputCache.size(), InputCache[0].size(), InputCache[0][0].size());
-        
-        for (size_t c = 0; c < dOutput.size(); c++) {
-            for (size_t h = 0; h < dOutput[c].size(); h++) {
-                for (size_t w = 0; w < dOutput[c][h].size(); w++) {
-                    int ph = h * FStride + MaxIndices[c][h][w].second;
-                    int pw = w * FStride + MaxIndices[c][h][w].first;
+
+    void Backward(const TDArray3D& dOutput, TDArray3D& dInput) {
+        int Channels = InputCache.size();
+        int Height = InputCache[0].size();
+        int Width = InputCache[0][0].size();
+
+        Zero3DArray(dInput, Channels, Height, Width);
+
+        for (int c = 0; c < (int)dOutput.size(); c++) {
+            for (int h = 0; h < (int)dOutput[c].size(); h++) {
+                for (int w = 0; w < (int)dOutput[c][h].size(); w++) {
+                    int ph = h * FStride + MaxIndices[c][h][w].Y;
+                    int pw = w * FStride + MaxIndices[c][h][w].X;
                     dInput[c][ph][pw] = dOutput[c][h][w];
                 }
             }
@@ -932,799 +722,1281 @@ public:
     }
 };
 
-// ========== Fully Connected Layer ==========
+// ========== TFCLayer Class (Fully Connected Layer) ==========
 class TFCLayer {
 private:
-    int FInputSize, FOutputSize;
-    ActivationType FActivation;
-    
+    int FInputSize;
+    int FOutputSize;
+    TActivationType FActivation;
+
 public:
-    TFArray2D W;
-    FArray B;
-    TFArray2D dW;
-    FArray dB;
-    FArray InputCache;
-    FArray OutputCache;
-    FArray PreActivation;
+    TDArray2D W;
+    DArray B;
+    TDArray2D dW;
+    DArray dB;
+    DArray InputCache;
+    DArray OutputCache;
+    DArray PreActivation;
     
-    cl_mem gpu_W, gpu_B, gpu_dW, gpu_dB, gpu_input, gpu_output, gpu_preact;
-    TOpenCLContext* oclCtx;
-    
-    TFCLayer(int InputSize, int OutputSize, ActivationType Activation, TOpenCLContext* OclCtx) {
-        FInputSize = InputSize;
-        FOutputSize = OutputSize;
-        FActivation = Activation;
-        oclCtx = OclCtx;
-        
-        double Scale = sqrt(2.0 / InputSize);
-        
-        InitMatrixF(W, OutputSize, InputSize, Scale);
-        ZeroArrayF(B, OutputSize);
-        ZeroMatrixF(dW, OutputSize, InputSize);
-        ZeroArrayF(dB, OutputSize);
-        
-        gpu_input = nullptr;
-        gpu_output = nullptr;
-        gpu_preact = nullptr;
-        
-        cl_int err;
-        FArray flatW(W.size() * W[0].size());
-        int idx = 0;
-        for (size_t i = 0; i < W.size(); i++) {
-            for (size_t j = 0; j < W[i].size(); j++) {
-                flatW[idx++] = W[i][j];
-            }
+    cl_mem WBuffer;
+    cl_mem BBuffer;
+    cl_mem dWBuffer;
+    cl_mem dBBuffer;
+
+    TFCLayer(int InputSize, int OutputSize, TActivationType Activation)
+    : FInputSize(InputSize),
+    FOutputSize(OutputSize),
+    FActivation(Activation),
+    WBuffer(nullptr),
+    BBuffer(nullptr),
+    dWBuffer(nullptr),
+    dBBuffer(nullptr) {
+
+        double Scale;
+        if (InputSize > 0) {
+            Scale = std::sqrt(2.0 / InputSize);
+        } else {
+            Scale = 0.1;
         }
+
+        InitMatrix(W, OutputSize, InputSize, Scale);
+        ZeroArray(B, OutputSize);
+        ZeroMatrix(dW, OutputSize, InputSize);
+        ZeroArray(dB, OutputSize);
         
-        gpu_W = clCreateBuffer(oclCtx->context, CL_MEM_READ_WRITE | CL_MEM_COPY_HOST_PTR,
-                              sizeof(float) * flatW.size(), flatW.data(), &err);
-        CL_CHECK(err);
-        
-        gpu_B = clCreateBuffer(oclCtx->context, CL_MEM_READ_WRITE | CL_MEM_COPY_HOST_PTR,
-                              sizeof(float) * B.size(), B.data(), &err);
-        CL_CHECK(err);
-        
-        gpu_dW = clCreateBuffer(oclCtx->context, CL_MEM_READ_WRITE,
-                               sizeof(float) * flatW.size(), nullptr, &err);
-        CL_CHECK(err);
-        
-        gpu_dB = clCreateBuffer(oclCtx->context, CL_MEM_READ_WRITE,
-                               sizeof(float) * B.size(), nullptr, &err);
-        CL_CHECK(err);
+        AllocateGPUBuffers();
     }
     
     ~TFCLayer() {
-        clReleaseMemObject(gpu_W);
-        clReleaseMemObject(gpu_B);
-        clReleaseMemObject(gpu_dW);
-        clReleaseMemObject(gpu_dB);
-        if (gpu_input) clReleaseMemObject(gpu_input);
-        if (gpu_output) clReleaseMemObject(gpu_output);
-        if (gpu_preact) clReleaseMemObject(gpu_preact);
+        if (WBuffer) clReleaseMemObject(WBuffer);
+        if (BBuffer) clReleaseMemObject(BBuffer);
+        if (dWBuffer) clReleaseMemObject(dWBuffer);
+        if (dBBuffer) clReleaseMemObject(dBBuffer);
     }
     
-    void Forward(const FArray& Input, FArray& Output) {
+    void AllocateGPUBuffers() {
+        cl_int err;
+        size_t wSize = W.size() * W[0].size() * sizeof(double);
+        size_t bSize = B.size() * sizeof(double);
+        
+        WBuffer = clCreateBuffer(gOpenCLContext.context, CL_MEM_READ_WRITE, wSize, nullptr, &err);
+        BBuffer = clCreateBuffer(gOpenCLContext.context, CL_MEM_READ_WRITE, bSize, nullptr, &err);
+        dWBuffer = clCreateBuffer(gOpenCLContext.context, CL_MEM_READ_WRITE, wSize, nullptr, &err);
+        dBBuffer = clCreateBuffer(gOpenCLContext.context, CL_MEM_READ_WRITE, bSize, nullptr, &err);
+    }
+    
+    void CopyToGPU() {
+        std::vector<double> flatW;
+        for (size_t i = 0; i < W.size(); i++) {
+            for (size_t j = 0; j < W[i].size(); j++) {
+                flatW.push_back(W[i][j]);
+            }
+        }
+        clEnqueueWriteBuffer(gOpenCLContext.queue, WBuffer, CL_TRUE, 0,
+                           flatW.size() * sizeof(double), flatW.data(), 0, nullptr, nullptr);
+        clEnqueueWriteBuffer(gOpenCLContext.queue, BBuffer, CL_TRUE, 0,
+                           B.size() * sizeof(double), B.data(), 0, nullptr, nullptr);
+    }
+    
+    void CopyFromGPU() {
+        std::vector<double> flatW(W.size() * W[0].size());
+        clEnqueueReadBuffer(gOpenCLContext.queue, WBuffer, CL_TRUE, 0,
+                          flatW.size() * sizeof(double), flatW.data(), 0, nullptr, nullptr);
+        
+        size_t idx = 0;
+        for (size_t i = 0; i < W.size(); i++) {
+            for (size_t j = 0; j < W[i].size(); j++) {
+                W[i][j] = flatW[idx++];
+            }
+        }
+        clEnqueueReadBuffer(gOpenCLContext.queue, BBuffer, CL_TRUE, 0,
+                          B.size() * sizeof(double), B.data(), 0, nullptr, nullptr);
+    }
+
+    void Forward(const DArray& Input, DArray& Output) {
         InputCache = Input;
         Output.resize(FOutputSize);
         PreActivation.resize(FOutputSize);
-        
+
         for (int i = 0; i < FOutputSize; i++) {
-            float Sum = B[i];
+            double Sum = B[i];
             for (int j = 0; j < FInputSize; j++) {
                 Sum += W[i][j] * Input[j];
             }
             PreActivation[i] = Sum;
-            Output[i] = (FActivation == atLinear) ? Sum : (FActivation == atReLU ? (Sum > 0 ? Sum : 0) : 
-                       (FActivation == atSigmoid ? (1.0f / (1.0f + exp(-Sum))) : tanh(Sum)));
+            Output[i] = TActivation::Apply(Sum, FActivation);
         }
-        
+
         OutputCache = Output;
     }
-    
-    void Backward(const FArray& dOutput, FArray& dInput) {
-        dInput.assign(FInputSize, 0.0f);
-        
+
+    void Backward(const DArray& dOutput, DArray& dInput) {
+        dInput.resize(FInputSize);
+        for (int i = 0; i < FInputSize; i++) {
+            dInput[i] = 0.0;
+        }
+
         for (int i = 0; i < FOutputSize; i++) {
-            float deriv = (FActivation == atLinear) ? 1.0f : 
-                         (FActivation == atReLU ? (OutputCache[i] > 0 ? 1.0f : 0.0f) :
-                         (FActivation == atSigmoid ? (OutputCache[i] * (1.0f - OutputCache[i])) : 
-                         (1.0f - OutputCache[i] * OutputCache[i])));
-            
-            float dRaw = dOutput[i] * deriv;
+            double dRaw = dOutput[i] * TActivation::Derivative(OutputCache[i], FActivation);
             dB[i] += dRaw;
-            
+
             for (int j = 0; j < FInputSize; j++) {
                 dW[i][j] += dRaw * InputCache[j];
                 dInput[j] += dRaw * W[i][j];
             }
         }
     }
-    
+
     void ApplyGradients(double LR, double ClipVal) {
         for (int i = 0; i < FOutputSize; i++) {
-            B[i] -= LR * dB[i];
-            dB[i] = 0;
-            
+            B[i] -= LR * ClipValue(dB[i], ClipVal);
+            dB[i] = 0.0;
+
             for (int j = 0; j < FInputSize; j++) {
-                W[i][j] -= LR * dW[i][j];
-                dW[i][j] = 0;
+                W[i][j] -= LR * ClipValue(dW[i][j], ClipVal);
+                dW[i][j] = 0.0;
             }
         }
     }
-    
+
     void ResetGradients() {
         for (int i = 0; i < FOutputSize; i++) {
-            dB[i] = 0;
+            dB[i] = 0.0;
             for (int j = 0; j < FInputSize; j++) {
-                dW[i][j] = 0;
+                dW[i][j] = 0.0;
             }
         }
     }
 };
 
-// ========== Main Advanced CNN (OpenCL version) ==========
-class TAdvancedCNNOpenCL {
+// ========== TAdvancedCNN Class ==========
+class TAdvancedCNN {
 private:
-    int FInputWidth, FInputHeight, FInputChannels, FOutputSize;
-    ActivationType FActivation, FOutputActivation;
-    LossType FLossType;
-    double FLearningRate, FGradientClip;
-    
-    vector<TConvLayer*> FConvLayers;
-    vector<TPoolingLayer*> FPoolLayers;
-    vector<TFCLayer*> FFullyConnectedLayers;
+    int FInputWidth;
+    int FInputHeight;
+    int FInputChannels;
+    int FOutputSize;
+    TActivationType FActivation;
+    TActivationType FOutputActivation;
+    TLossType FLossType;
+    double FLearningRate;
+    double FGradientClip;
+
+    // Store metadata for JSON serialization
+    std::vector<int> FConvFilters;
+    std::vector<int> FKernelSizes;
+    std::vector<int> FPoolSizes;
+    std::vector<int> FFCLayerSizes;
+
+    std::vector<TConvLayer*> FConvLayers;
+    std::vector<TPoolingLayer*> FPoolLayers;
+    std::vector<TFCLayer*> FFullyConnectedLayers;
     TFCLayer* FOutputLayer;
     int FFlattenedSize;
-    
-    TOpenCLContext* oclCtx;
-    
-public:
-    TAdvancedCNNOpenCL(int InputWidth, int InputHeight, int InputChannels,
-                       const TIntArray& ConvFilters,
-                       const TIntArray& KernelSizes,
-                       const TIntArray& PoolSizes,
-                       const TIntArray& FCLayerSizes,
-                       int OutputSize,
-                       ActivationType Activation,
-                       ActivationType OutputActivation,
-                       LossType LossType,
-                       double LearningRate,
-                       double GradientClip) {
-        
-        oclCtx = new TOpenCLContext();
-        
-        FInputWidth = InputWidth;
-        FInputHeight = InputHeight;
-        FInputChannels = InputChannels;
-        FOutputSize = OutputSize;
-        FActivation = Activation;
-        FOutputActivation = OutputActivation;
-        FLossType = LossType;
-        FLearningRate = LearningRate;
-        FGradientClip = GradientClip;
-        
-        int CurrentChannels = InputChannels;
-        int CurrentWidth = InputWidth;
-        int CurrentHeight = InputHeight;
-        
-        FConvLayers.resize(ConvFilters.size());
-        for (size_t i = 0; i < ConvFilters.size(); i++) {
-            FConvLayers[i] = new TConvLayer(CurrentChannels, ConvFilters[i], 
-                                            KernelSizes[i], 1, KernelSizes[i] / 2, 
-                                            Activation, oclCtx);
-            CurrentChannels = ConvFilters[i];
-            
-            if (i < PoolSizes.size()) {
-                CurrentWidth /= PoolSizes[i];
-                CurrentHeight /= PoolSizes[i];
-            }
-        }
-        
-        FPoolLayers.resize(PoolSizes.size());
-        for (size_t i = 0; i < PoolSizes.size(); i++) {
-            FPoolLayers[i] = new TPoolingLayer(PoolSizes[i], PoolSizes[i]);
-        }
-        
-        FFlattenedSize = CurrentChannels * CurrentWidth * CurrentHeight;
-        
-        int NumInputs = FFlattenedSize;
-        FFullyConnectedLayers.resize(FCLayerSizes.size());
-        for (size_t i = 0; i < FCLayerSizes.size(); i++) {
-            FFullyConnectedLayers[i] = new TFCLayer(NumInputs, FCLayerSizes[i], Activation, oclCtx);
-            NumInputs = FCLayerSizes[i];
-        }
-        
-        FOutputLayer = new TFCLayer(NumInputs, OutputSize, OutputActivation, oclCtx);
+
+    double ClipGradient(double G, double MaxVal) {
+        return ClipValue(G, MaxVal);
     }
-    
-    ~TAdvancedCNNOpenCL() {
-        for (auto& layer : FConvLayers) {
-            delete layer;
-        }
-        for (auto& layer : FPoolLayers) {
-            delete layer;
-        }
-        for (auto& layer : FFullyConnectedLayers) {
-            delete layer;
-        }
-        delete FOutputLayer;
-        FConvLayers.clear();
-        FPoolLayers.clear();
-        FFullyConnectedLayers.clear();
-        
-        delete oclCtx;
-    }
-    
-    FArray Flatten(const TFArray3D& Input) {
-        FArray Result;
-        Result.reserve(Input.size() * Input[0].size() * Input[0][0].size());
-        for (size_t c = 0; c < Input.size(); c++) {
-            for (size_t h = 0; h < Input[c].size(); h++) {
-                for (size_t w = 0; w < Input[c][h].size(); w++) {
-                    Result.push_back(Input[c][h][w]);
-                }
-            }
-        }
-        return Result;
-    }
-    
-    TFArray3D Unflatten(const FArray& Input, int Channels, int Height, int Width) {
-        TFArray3D Result;
-        Zero3DArrayF(Result, Channels, Height, Width);
-        size_t idx = 0;
+
+    DArray Flatten(const TDArray3D& Input) {
+        int Channels = Input.size();
+        int Height = Input[0].size();
+        int Width = Input[0][0].size();
+
+        DArray Result;
+        Result.resize(Channels * Height * Width);
+
+        int idx = 0;
         for (int c = 0; c < Channels; c++) {
             for (int h = 0; h < Height; h++) {
                 for (int w = 0; w < Width; w++) {
-                    Result[c][h][w] = Input[idx++];
+                    Result[idx] = Input[c][h][w];
+                    idx++;
                 }
             }
         }
+
         return Result;
     }
-    
-    FArray ForwardPass(const TFArray3D& Input) {
-        TFArray3D CurrentOutput = Input;
-        
-        for (size_t i = 0; i < FConvLayers.size(); i++) {
-            FConvLayers[i]->Forward(CurrentOutput, CurrentOutput);
-            
-            if (i < FPoolLayers.size()) {
-                FPoolLayers[i]->Forward(CurrentOutput, CurrentOutput);
+
+    TDArray3D Unflatten(const DArray& Input, int Channels, int Height, int Width) {
+        TDArray3D Result;
+        Result.resize(Channels);
+
+        int idx = 0;
+        for (int c = 0; c < Channels; c++) {
+            Result[c].resize(Height);
+            for (int h = 0; h < Height; h++) {
+                Result[c][h].resize(Width);
+                for (int w = 0; w < Width; w++) {
+                    Result[c][h][w] = Input[idx];
+                    idx++;
+                }
             }
         }
-        
-        FArray FlatInput = Flatten(CurrentOutput);
-        FArray LayerInput = FlatInput;
-        
-        for (auto& layer : FFullyConnectedLayers) {
-            layer->Forward(LayerInput, LayerInput);
+
+        return Result;
+    }
+
+public:
+    TAdvancedCNN(int InputWidth, int InputHeight, int InputChannels,
+                 const std::vector<int>& ConvFilters,
+                 const std::vector<int>& KernelSizes,
+                 const std::vector<int>& PoolSizes,
+                 const std::vector<int>& FCLayerSizes,
+                 int OutputSize,
+                 TActivationType Activation,
+                 TActivationType OutputActivation,
+                 TLossType LossType,
+                 double LearningRate,
+                 double GradientClip)
+         : FInputWidth(InputWidth),
+           FInputHeight(InputHeight),
+           FInputChannels(InputChannels),
+           FOutputSize(OutputSize),
+           FActivation(Activation),
+           FOutputActivation(OutputActivation),
+           FLossType(LossType),
+           FLearningRate(LearningRate),
+           FGradientClip(GradientClip),
+           FConvFilters(ConvFilters),
+           FKernelSizes(KernelSizes),
+           FPoolSizes(PoolSizes),
+           FFCLayerSizes(FCLayerSizes) {
+
+         int CurrentChannels = InputChannels;
+         int CurrentWidth = InputWidth;
+         int CurrentHeight = InputHeight;
+
+         // Create convolutional layers
+         FConvLayers.resize(ConvFilters.size());
+         for (size_t i = 0; i < ConvFilters.size(); i++) {
+             FConvLayers[i] = new TConvLayer(CurrentChannels, ConvFilters[i],
+                                             KernelSizes[i], 1, KernelSizes[i] / 2, Activation);
+             CurrentChannels = ConvFilters[i];
+             // CurrentWidth and CurrentHeight remain the same due to padding
+
+             if (i < PoolSizes.size()) {
+                 CurrentWidth = CurrentWidth / PoolSizes[i];
+                 CurrentHeight = CurrentHeight / PoolSizes[i];
+             }
+         }
+
+         // Create pooling layers
+         FPoolLayers.resize(PoolSizes.size());
+         for (size_t i = 0; i < PoolSizes.size(); i++) {
+             FPoolLayers[i] = new TPoolingLayer(PoolSizes[i], PoolSizes[i]);
+         }
+
+         // Calculate flattened size
+         FFlattenedSize = CurrentChannels * CurrentWidth * CurrentHeight;
+
+         // Create fully connected layers
+         FFullyConnectedLayers.resize(FCLayerSizes.size());
+         int NumInputs = FFlattenedSize;
+         for (size_t i = 0; i < FCLayerSizes.size(); i++) {
+             FFullyConnectedLayers[i] = new TFCLayer(NumInputs, FCLayerSizes[i], Activation);
+             NumInputs = FCLayerSizes[i];
+         }
+
+         // Create output layer
+         FOutputLayer = new TFCLayer(NumInputs, OutputSize, OutputActivation);
+     }
+
+    ~TAdvancedCNN() {
+        for (size_t i = 0; i < FConvLayers.size(); i++) {
+            delete FConvLayers[i];
         }
-        
-        FArray Logits(FOutputSize);
-        FOutputLayer->Forward(LayerInput, Logits);
-        
+        for (size_t i = 0; i < FPoolLayers.size(); i++) {
+            delete FPoolLayers[i];
+        }
+        for (size_t i = 0; i < FFullyConnectedLayers.size(); i++) {
+            delete FFullyConnectedLayers[i];
+        }
+        delete FOutputLayer;
+    }
+
+    // Getters and setters for properties
+    double GetLearningRate() const { return FLearningRate; }
+    void SetLearningRate(double value) { FLearningRate = value; }
+
+    double GetGradientClip() const { return FGradientClip; }
+    void SetGradientClip(double value) { FGradientClip = value; }
+
+    // Methods continued in Section 8...
+    DArray ForwardPass(const TDArray3D& Input);
+    double BackwardPass(const DArray& Target);
+    double TrainSample(const TDArray3D& Input, const DArray& Target);
+    double TrainBatch(const TDArray4D& BatchInputs, const TDArray2D& BatchTargets);
+    DArray Predict(const TDArray3D& Input);
+    double ComputeLoss(const TDArray4D& Inputs, const TDArray2D& Targets);
+    void ResetGradients();
+    void ApplyGradients();
+
+    // JSON methods continued in Section 9...
+    void SaveModelToJSON(const std::string& Filename);
+    void LoadModelFromJSON(const std::string& Filename);
+    std::string Array1DToJSON(const DArray& Arr);
+    std::string Array2DToJSON(const TDArray2D& Arr);
+    std::string Array3DToJSON(const TDArray3D& Arr);
+    std::string Array4DToJSON(const TDArray4D& Arr);
+};
+
+// ========== TAdvancedCNN Class (continued) ==========
+
+DArray TAdvancedCNN::ForwardPass(const TDArray3D& Input) {
+    TDArray3D CurrentOutput = Input;
+
+    // Forward through convolutional and pooling layers
+    for (size_t i = 0; i < FConvLayers.size(); i++) {
+        FConvLayers[i]->Forward(CurrentOutput, CurrentOutput);
+
+        if (i < FPoolLayers.size()) {
+            FPoolLayers[i]->Forward(CurrentOutput, CurrentOutput);
+        }
+    }
+
+    // Flatten
+    DArray FlatInput = Flatten(CurrentOutput);
+    DArray LayerInput = FlatInput;
+
+    // Forward through fully connected layers
+    for (size_t i = 0; i < FFullyConnectedLayers.size(); i++) {
+        FFullyConnectedLayers[i]->Forward(LayerInput, LayerInput);
+    }
+
+    // Forward through output layer
+    DArray Logits;
+    Logits.resize(FOutputSize);
+    FOutputLayer->Forward(LayerInput, Logits);
+
+    // Apply output activation
+    if (FOutputActivation == TActivationType::atLinear) {
+        return Logits;
+    } else {
+        TActivation::ApplySoftmax(Logits);
         return Logits;
     }
-    
-    double GetLearningRate() const { return FLearningRate; }
-    void SetLearningRate(double LR) { FLearningRate = LR; }
-    double GetGradientClip() const { return FGradientClip; }
-    void SetGradientClip(double GC) { FGradientClip = GC; }
-    
-    std::string Array1DToJSON(const FArray& Arr) {
-        std::ostringstream oss;
-        oss << std::setprecision(17);
-        oss << "[";
-        for (size_t i = 0; i < Arr.size(); i++) {
-            oss << Arr[i];
-            if (i < Arr.size() - 1) oss << ",";
-        }
-        oss << "]";
-        return oss.str();
+}
+
+double TAdvancedCNN::BackwardPass(const DArray& Target) {
+    // Compute output gradient
+    DArray OutputGrad;
+    OutputGrad.resize(FOutputSize);
+    for (int i = 0; i < FOutputSize; i++) {
+        OutputGrad[i] = FOutputLayer->OutputCache[i] - Target[i];
     }
-    
-    std::string Array2DToJSON(const TFArray2D& Arr) {
-        std::ostringstream oss;
-        oss << std::setprecision(17);
-        oss << "[";
-        for (size_t i = 0; i < Arr.size(); i++) {
-            oss << Array1DToJSON(Arr[i]);
-            if (i < Arr.size() - 1) oss << ",";
-        }
-        oss << "]";
-        return oss.str();
+
+    // Backward through output layer
+    DArray FCGrad;
+    FOutputLayer->Backward(OutputGrad, FCGrad);
+
+    // Backward through fully connected layers
+    for (int i = FFullyConnectedLayers.size() - 1; i >= 0; i--) {
+        FFullyConnectedLayers[i]->Backward(FCGrad, FCGrad);
     }
-    
-    std::string Array3DToJSON(const TFArray3D& Arr) {
-        std::ostringstream oss;
-        oss << std::setprecision(17);
-        oss << "[";
-        for (size_t i = 0; i < Arr.size(); i++) {
-            oss << Array2DToJSON(Arr[i]);
-            if (i < Arr.size() - 1) oss << ",";
+
+    // Unflatten gradient
+    int LastConvIdx = FConvLayers.size() - 1;
+    TDArray3D CurrentGrad = Unflatten(FCGrad,
+                                      FConvLayers[LastConvIdx]->OutputCache.size(),
+                                      FConvLayers[LastConvIdx]->OutputCache[0].size(),
+                                      FConvLayers[LastConvIdx]->OutputCache[0][0].size());
+
+    // Backward through convolutional and pooling layers
+    for (int i = FConvLayers.size() - 1; i >= 0; i--) {
+        if (i < (int)FPoolLayers.size()) {
+            FPoolLayers[i]->Backward(CurrentGrad, CurrentGrad);
         }
-        oss << "]";
-        return oss.str();
+        FConvLayers[i]->Backward(CurrentGrad, CurrentGrad);
     }
-    
-    std::string Array4DToJSON(const TFArray4D& Arr) {
-        std::ostringstream oss;
-        oss << std::setprecision(17);
-        oss << "[";
-        for (size_t i = 0; i < Arr.size(); i++) {
-            oss << Array3DToJSON(Arr[i]);
-            if (i < Arr.size() - 1) oss << ",";
-        }
-        oss << "]";
-        return oss.str();
+
+    // Compute and return loss
+    return TLoss::Compute(FOutputLayer->OutputCache, Target, FLossType);
+}
+
+double TAdvancedCNN::TrainSample(const TDArray3D& Input, const DArray& Target) {
+    ResetGradients();
+    ForwardPass(Input);
+    double Loss = BackwardPass(Target);
+    ApplyGradients();
+    return Loss;
+}
+
+double TAdvancedCNN::TrainBatch(const TDArray4D& BatchInputs, const TDArray2D& BatchTargets) {
+    ResetGradients();
+    double BatchLoss = 0.0;
+
+    for (size_t b = 0; b < BatchInputs.size(); b++) {
+        ForwardPass(BatchInputs[b]);
+        BatchLoss += BackwardPass(BatchTargets[b]);
     }
-    
-    void SaveModelToJSON(const std::string& Filename) {
-        std::ofstream file(Filename);
-        if (!file.is_open()) {
-            throw std::runtime_error("Cannot open file for writing: " + Filename);
+
+    ApplyGradients();
+    return BatchLoss / BatchInputs.size();
+}
+
+DArray TAdvancedCNN::Predict(const TDArray3D& Input) {
+    return ForwardPass(Input);
+}
+
+double TAdvancedCNN::ComputeLoss(const TDArray4D& Inputs, const TDArray2D& Targets) {
+    double Result = 0.0;
+
+    for (size_t i = 0; i < Inputs.size(); i++) {
+        DArray Output = ForwardPass(Inputs[i]);
+        Result += TLoss::Compute(Output, Targets[i], FLossType);
+    }
+
+    return Result / Inputs.size();
+}
+
+void TAdvancedCNN::ResetGradients() {
+    for (size_t i = 0; i < FConvLayers.size(); i++) {
+        FConvLayers[i]->ResetGradients();
+    }
+    for (size_t i = 0; i < FFullyConnectedLayers.size(); i++) {
+        FFullyConnectedLayers[i]->ResetGradients();
+    }
+    FOutputLayer->ResetGradients();
+}
+
+// ========== TAdvancedCNN Class (continued from Section 8) ==========
+
+void TAdvancedCNN::ApplyGradients() {
+    for (size_t i = 0; i < FConvLayers.size(); i++) {
+        FConvLayers[i]->ApplyGradients(FLearningRate, FGradientClip);
+    }
+    for (size_t i = 0; i < FFullyConnectedLayers.size(); i++) {
+        FFullyConnectedLayers[i]->ApplyGradients(FLearningRate, FGradientClip);
+    }
+    FOutputLayer->ApplyGradients(FLearningRate, FGradientClip);
+}
+
+// JSON Serialization Helper Functions
+std::string TAdvancedCNN::Array1DToJSON(const DArray& Arr) {
+    std::ostringstream oss;
+    oss << std::setprecision(17);
+    oss << "[";
+    for (size_t i = 0; i < Arr.size(); i++) {
+        oss << Arr[i];
+        if (i < Arr.size() - 1) oss << ",";
+    }
+    oss << "]";
+    return oss.str();
+}
+
+std::string TAdvancedCNN::Array2DToJSON(const TDArray2D& Arr) {
+    std::ostringstream oss;
+    oss << std::setprecision(17);
+    oss << "[";
+    for (size_t i = 0; i < Arr.size(); i++) {
+        oss << Array1DToJSON(Arr[i]);
+        if (i < Arr.size() - 1) oss << ",";
+    }
+    oss << "]";
+    return oss.str();
+}
+
+std::string TAdvancedCNN::Array3DToJSON(const TDArray3D& Arr) {
+    std::ostringstream oss;
+    oss << std::setprecision(17);
+    oss << "[";
+    for (size_t i = 0; i < Arr.size(); i++) {
+        oss << Array2DToJSON(Arr[i]);
+        if (i < Arr.size() - 1) oss << ",";
+    }
+    oss << "]";
+    return oss.str();
+}
+
+std::string TAdvancedCNN::Array4DToJSON(const TDArray4D& Arr) {
+    std::ostringstream oss;
+    oss << std::setprecision(17);
+    oss << "[";
+    for (size_t i = 0; i < Arr.size(); i++) {
+        oss << Array3DToJSON(Arr[i]);
+        if (i < Arr.size() - 1) oss << ",";
+    }
+    oss << "]";
+    return oss.str();
+}
+
+void TAdvancedCNN::SaveModelToJSON(const std::string& Filename) {
+    std::ofstream file(Filename);
+    if (!file.is_open()) {
+        throw std::runtime_error("Cannot open file for writing: " + Filename);
+    }
+
+    file << std::setprecision(17);
+    file << "{\n";
+
+    // Model architecture
+    file << "  \"input_width\": " << FInputWidth << ",\n";
+    file << "  \"input_height\": " << FInputHeight << ",\n";
+    file << "  \"input_channels\": " << FInputChannels << ",\n";
+    file << "  \"output_size\": " << FOutputSize << ",\n";
+    file << "  \"learning_rate\": " << FLearningRate << ",\n";
+    file << "  \"gradient_clip\": " << FGradientClip << ",\n";
+
+    // Activation types
+    file << "  \"activation\": " << static_cast<int>(FActivation) << ",\n";
+    file << "  \"output_activation\": " << static_cast<int>(FOutputActivation) << ",\n";
+    file << "  \"loss_type\": " << static_cast<int>(FLossType) << ",\n";
+
+    // Layer metadata - required for cross-app compatibility
+    file << "  \"conv_filters\": [";
+    for (size_t i = 0; i < FConvFilters.size(); i++) {
+        if (i > 0) file << ",";
+        file << FConvFilters[i];
+    }
+    file << "],\n";
+
+    file << "  \"kernel_sizes\": [";
+    for (size_t i = 0; i < FKernelSizes.size(); i++) {
+        if (i > 0) file << ",";
+        file << FKernelSizes[i];
+    }
+    file << "],\n";
+
+    file << "  \"pool_sizes\": [";
+    for (size_t i = 0; i < FPoolSizes.size(); i++) {
+        if (i > 0) file << ",";
+        file << FPoolSizes[i];
+    }
+    file << "],\n";
+
+    file << "  \"fc_layer_sizes\": [";
+    for (size_t i = 0; i < FFCLayerSizes.size(); i++) {
+        if (i > 0) file << ",";
+        file << FFCLayerSizes[i];
+    }
+    file << "],\n";
+
+    // Convolutional layers
+    file << "  \"conv_layers\": [\n";
+    for (size_t i = 0; i < FConvLayers.size(); i++) {
+        file << "    {\n";
+        file << "      \"filters\": [\n";
+        for (size_t f = 0; f < FConvLayers[i]->Filters.size(); f++) {
+            file << "        {\n";
+            file << "          \"weights\": " << Array4DToJSON(FConvLayers[i]->Filters[f]->Weights) << ",\n";
+            file << "          \"bias\": " << FConvLayers[i]->Filters[f]->Bias << "\n";
+            file << "        }";
+            if (f < FConvLayers[i]->Filters.size() - 1) file << ",";
+            file << "\n";
         }
-        
-        file << std::setprecision(17);
-        file << "{\n";
-        
-        // Model architecture
-        file << "  \"input_width\": " << FInputWidth << ",\n";
-        file << "  \"input_height\": " << FInputHeight << ",\n";
-        file << "  \"input_channels\": " << FInputChannels << ",\n";
-        file << "  \"output_size\": " << FOutputSize << ",\n";
-        file << "  \"learning_rate\": " << FLearningRate << ",\n";
-        file << "  \"gradient_clip\": " << FGradientClip << ",\n";
-        
-        // Activation types
-        file << "  \"activation\": " << static_cast<int>(FActivation) << ",\n";
-        file << "  \"output_activation\": " << static_cast<int>(FOutputActivation) << ",\n";
-        file << "  \"loss_type\": " << static_cast<int>(FLossType) << ",\n";
-        
-        // Convolutional layers
-        file << "  \"conv_layers\": [\n";
-        for (size_t i = 0; i < FConvLayers.size(); i++) {
-            file << "    {\n";
-            file << "      \"filters\": [\n";
-            for (size_t f = 0; f < FConvLayers[i]->Filters.size(); f++) {
-                file << "        {\n";
-                file << "          \"weights\": " << Array4DToJSON(FConvLayers[i]->Filters[f]->Weights) << ",\n";
-                file << "          \"bias\": " << FConvLayers[i]->Filters[f]->Bias << "\n";
-                file << "        }";
-                if (f < FConvLayers[i]->Filters.size() - 1) file << ",";
-                file << "\n";
+        file << "      ]\n";
+        file << "    }";
+        if (i < FConvLayers.size() - 1) file << ",";
+        file << "\n";
+    }
+    file << "  ],\n";
+
+    // Fully connected layers
+    file << "  \"fc_layers\": [\n";
+    for (size_t i = 0; i < FFullyConnectedLayers.size(); i++) {
+        file << "    {\n";
+        file << "      \"weights\": " << Array2DToJSON(FFullyConnectedLayers[i]->W) << ",\n";
+        file << "      \"bias\": " << Array1DToJSON(FFullyConnectedLayers[i]->B) << "\n";
+        file << "    }";
+        if (i < FFullyConnectedLayers.size() - 1) file << ",";
+        file << "\n";
+    }
+    file << "  ],\n";
+
+    // Output layer
+    file << "  \"output_layer\": {\n";
+    file << "    \"weights\": " << Array2DToJSON(FOutputLayer->W) << ",\n";
+    file << "    \"bias\": " << Array1DToJSON(FOutputLayer->B) << "\n";
+    file << "  }\n";
+
+    file << "}\n";
+    file.close();
+}
+
+void TAdvancedCNN::LoadModelFromJSON(const std::string& Filename) {
+    std::ifstream file(Filename);
+    if (!file.is_open()) {
+        throw std::runtime_error("Cannot open file for reading: " + Filename);
+    }
+
+    std::string content((std::istreambuf_iterator<char>(file)),
+                        std::istreambuf_iterator<char>());
+    file.close();
+
+    // Simple JSON parser for the specific structure we saved
+    // Note: This is a basic implementation.  For production use, consider a proper JSON library.
+
+    auto findValue = [&content](const std::string& key) -> std::string {
+        std::string searchKey = "\"" + key + "\": ";
+        size_t pos = content.find(searchKey);
+        if (pos == std::string::npos) return "";
+
+        pos += searchKey.length();
+        while (pos < content.length() && (content[pos] == ' ' || content[pos] == '\n')) pos++;
+
+        size_t endPos = pos;
+        if (content[pos] == '"') {
+            endPos = content.find('"', pos + 1);
+            return content.substr(pos + 1, endPos - pos - 1);
+        } else if (content[pos] == '[' || content[pos] == '{') {
+            int depth = 0;
+            char startChar = content[pos];
+            char endChar = (startChar == '[') ? ']' : '}';
+            do {
+                if (content[endPos] == startChar) depth++;
+                if (content[endPos] == endChar) depth--;
+                endPos++;
+            } while (depth > 0 && endPos < content.length());
+            return content.substr(pos, endPos - pos);
+        } else {
+            while (endPos < content.length() && content[endPos] != ',' &&
+                   content[endPos] != '\n' && content[endPos] != '}') endPos++;
+            return content.substr(pos, endPos - pos);
+        }
+    };
+
+    auto parseArray1D = [](const std::string& str) -> DArray {
+        DArray result;
+        if (str.empty() || str[0] != '[') return result;
+
+        std::string nums = str.substr(1, str.length() - 2);
+        std::istringstream iss(nums);
+        std::string token;
+        while (std::getline(iss, token, ',')) {
+            result.push_back(std::stod(token));
+        }
+        return result;
+    };
+
+    auto parseArray2D = [&parseArray1D](const std::string& str) -> TDArray2D {
+        TDArray2D result;
+        if (str.empty() || str[0] != '[') return result;
+
+        size_t pos = 1;
+        int depth = 0;
+        size_t start = pos;
+
+        while (pos < str.length() - 1) {
+            if (str[pos] == '[') {
+                if (depth == 0) start = pos;
+                depth++;
+            } else if (str[pos] == ']') {
+                depth--;
+                if (depth == 0) {
+                    result.push_back(parseArray1D(str.substr(start, pos - start + 1)));
+                }
             }
-            file << "      ]\n";
-            file << "    }";
-            if (i < FConvLayers.size() - 1) file << ",";
-            file << "\n";
+            pos++;
         }
-        file << "  ],\n";
-        
-        // Fully connected layers
-        file << "  \"fc_layers\": [\n";
-        for (size_t i = 0; i < FFullyConnectedLayers.size(); i++) {
-            file << "    {\n";
-            file << "      \"weights\": " << Array2DToJSON(FFullyConnectedLayers[i]->W) << ",\n";
-            file << "      \"bias\": " << Array1DToJSON(FFullyConnectedLayers[i]->B) << "\n";
-            file << "    }";
-            if (i < FFullyConnectedLayers.size() - 1) file << ",";
-            file << "\n";
+        return result;
+    };
+
+    auto parseArray4D = [&](const std::string& str) -> TDArray4D {
+        TDArray4D result;
+        if (str.empty() || str[0] != '[') return result;
+
+        size_t pos = 1;
+        int depth = 0;
+        size_t start = pos;
+
+        while (pos < str.length() - 1) {
+            if (str[pos] == '[') {
+                if (depth == 0) start = pos;
+                depth++;
+            } else if (str[pos] == ']') {
+                depth--;
+                if (depth == 0) {
+                    // Parse 3D array
+                    TDArray3D arr3d;
+                    std::string str3d = str.substr(start, pos - start + 1);
+
+                    size_t pos3 = 1;
+                    int depth3 = 0;
+                    size_t start3 = pos3;
+
+                    while (pos3 < str3d.length() - 1) {
+                        if (str3d[pos3] == '[') {
+                            if (depth3 == 0) start3 = pos3;
+                            depth3++;
+                        } else if (str3d[pos3] == ']') {
+                            depth3--;
+                            if (depth3 == 0) {
+                                arr3d.push_back(parseArray2D(str3d.substr(start3, pos3 - start3 + 1)));
+                            }
+                        }
+                        pos3++;
+                    }
+                    result.push_back(arr3d);
+                }
+            }
+            pos++;
         }
-        file << "  ],\n";
-        
-        // Output layer
-        file << "  \"output_layer\": {\n";
-        file << "    \"weights\": " << Array2DToJSON(FOutputLayer->W) << ",\n";
-        file << "    \"bias\": " << Array1DToJSON(FOutputLayer->B) << "\n";
-        file << "  }\n";
-        
-        file << "}\n";
-        file.close();
-    }
-    
-    void LoadModelFromJSON(const std::string& Filename) {
-        std::ifstream file(Filename);
-        if (!file.is_open()) {
-            throw std::runtime_error("Cannot open file for reading: " + Filename);
-        }
-        
-        std::string content((std::istreambuf_iterator<char>(file)),
-                            std::istreambuf_iterator<char>());
-        file.close();
-        
-        // Simple JSON parser for the specific structure we saved
-        auto findValue = [&content](const std::string& key) -> std::string {
-            std::string searchKey = "\"" + key + "\": ";
-            size_t pos = content.find(searchKey);
-            if (pos == std::string::npos) return "";
-            
-            pos += searchKey.length();
-            while (pos < content.length() && (content[pos] == ' ' || content[pos] == '\n')) pos++;
-            
-            size_t endPos = pos;
-            if (content[pos] == '"') {
-                endPos = content.find('"', pos + 1);
-                return content.substr(pos + 1, endPos - pos - 1);
-            } else if (content[pos] == '[' || content[pos] == '{') {
-                int depth = 0;
-                char startChar = content[pos];
-                char endChar = (startChar == '[') ? ']' : '}';
+        return result;
+    };
+
+    // Load architecture parameters
+    FLearningRate = std::stod(findValue("learning_rate"));
+    FGradientClip = std::stod(findValue("gradient_clip"));
+
+    // Load convolutional layers weights
+    std::string convLayersStr = findValue("conv_layers");
+    size_t convPos = 0;
+    int convDepth = 0;
+    size_t convLayerIdx = 0;
+
+    while (convPos < convLayersStr.length() && convLayerIdx < FConvLayers.size()) {
+        if (convLayersStr[convPos] == '{' && convDepth == 1) {
+            // Find filters array for this layer
+            size_t filtersStart = convLayersStr.find("\"filters\":", convPos);
+            if (filtersStart != std::string::npos) {
+                filtersStart = convLayersStr.find('[', filtersStart);
+                int filterDepth = 0;
+                size_t filtersEnd = filtersStart;
                 do {
-                    if (content[endPos] == startChar) depth++;
-                    if (content[endPos] == endChar) depth--;
-                    endPos++;
-                } while (depth > 0 && endPos < content.length());
-                return content.substr(pos, endPos - pos);
-            } else {
-                while (endPos < content.length() && content[endPos] != ',' &&
-                       content[endPos] != '\n' && content[endPos] != '}') endPos++;
-                return content.substr(pos, endPos - pos);
-            }
-        };
-        
-        auto parseArray1D = [](const std::string& str) -> FArray {
-            FArray result;
-            if (str.empty() || str[0] != '[') return result;
-            
-            std::string nums = str.substr(1, str.length() - 2);
-            std::istringstream iss(nums);
-            std::string token;
-            while (std::getline(iss, token, ',')) {
-                result.push_back(std::stof(token));
-            }
-            return result;
-        };
-        
-        auto parseArray2D = [&parseArray1D](const std::string& str) -> TFArray2D {
-            TFArray2D result;
-            if (str.empty() || str[0] != '[') return result;
-            
-            size_t pos = 1;
-            int depth = 0;
-            size_t start = pos;
-            
-            while (pos < str.length() - 1) {
-                if (str[pos] == '[') {
-                    if (depth == 0) start = pos;
-                    depth++;
-                } else if (str[pos] == ']') {
-                    depth--;
-                    if (depth == 0) {
-                        result.push_back(parseArray1D(str.substr(start, pos - start + 1)));
-                    }
-                }
-                pos++;
-            }
-            return result;
-        };
-        
-        auto parseArray4D = [&](const std::string& str) -> TFArray4D {
-            TFArray4D result;
-            if (str.empty() || str[0] != '[') return result;
-            
-            size_t pos = 1;
-            int depth = 0;
-            size_t start = pos;
-            
-            while (pos < str.length() - 1) {
-                if (str[pos] == '[') {
-                    if (depth == 0) start = pos;
-                    depth++;
-                } else if (str[pos] == ']') {
-                    depth--;
-                    if (depth == 0) {
-                        // Parse 3D array
-                        TFArray3D arr3d;
-                        std::string str3d = str.substr(start, pos - start + 1);
-                        
-                        size_t pos3 = 1;
-                        int depth3 = 0;
-                        size_t start3 = pos3;
-                        
-                        while (pos3 < str3d.length() - 1) {
-                            if (str3d[pos3] == '[') {
-                                if (depth3 == 0) start3 = pos3;
-                                depth3++;
-                            } else if (str3d[pos3] == ']') {
-                                depth3--;
-                                if (depth3 == 0) {
-                                    arr3d.push_back(parseArray2D(str3d.substr(start3, pos3 - start3 + 1)));
-                                }
-                            }
-                            pos3++;
+                    if (convLayersStr[filtersEnd] == '[') filterDepth++;
+                    if (convLayersStr[filtersEnd] == ']') filterDepth--;
+                    filtersEnd++;
+                } while (filterDepth > 0);
+
+                std::string filtersStr = convLayersStr.substr(filtersStart, filtersEnd - filtersStart);
+
+                // Parse each filter
+                size_t filterPos = 1;
+                size_t filterIdx = 0;
+                int fDepth = 0;
+
+                while (filterPos < filtersStr.length() && filterIdx < FConvLayers[convLayerIdx]->Filters.size()) {
+                    if (filtersStr[filterPos] == '{') {
+                        if (fDepth == 0) {
+                            size_t weightsStart = filtersStr.find("\"weights\":", filterPos);
+                            size_t weightsValStart = filtersStr.find('[', weightsStart);
+                            int wDepth = 0;
+                            size_t weightsEnd = weightsValStart;
+                            do {
+                                if (filtersStr[weightsEnd] == '[') wDepth++;
+                                if (filtersStr[weightsEnd] == ']') wDepth--;
+                                weightsEnd++;
+                            } while (wDepth > 0);
+
+                            std::string weightsStr = filtersStr.substr(weightsValStart, weightsEnd - weightsValStart);
+                            FConvLayers[convLayerIdx]->Filters[filterIdx]->Weights = parseArray4D(weightsStr);
+
+                            size_t biasStart = filtersStr.find("\"bias\":", filterPos);
+                            size_t biasValStart = biasStart + 7;
+                            while (filtersStr[biasValStart] == ' ') biasValStart++;
+                            size_t biasEnd = filtersStr.find_first_of(",\n}", biasValStart);
+                            FConvLayers[convLayerIdx]->Filters[filterIdx]->Bias =
+                                std::stod(filtersStr.substr(biasValStart, biasEnd - biasValStart));
+
+                            filterIdx++;
                         }
-                        result.push_back(arr3d);
+                        fDepth++;
+                    } else if (filtersStr[filterPos] == '}') {
+                        fDepth--;
                     }
+                    filterPos++;
                 }
-                pos++;
+
+                convPos = filtersEnd + convPos;
+                convLayerIdx++;
             }
-            return result;
-        };
-        
-        // Load architecture parameters
-        FLearningRate = std::stod(findValue("learning_rate"));
-        FGradientClip = std::stod(findValue("gradient_clip"));
-        
-        // Load convolutional layers weights
-        std::string convLayersStr = findValue("conv_layers");
-        size_t convPos = 0;
-        int convDepth = 0;
-        size_t convLayerIdx = 0;
-        
-        while (convPos < convLayersStr.length() && convLayerIdx < FConvLayers.size()) {
-            if (convLayersStr[convPos] == '{' && convDepth == 1) {
-                // Find filters array for this layer
-                size_t filtersStart = convLayersStr.find("\"filters\":", convPos);
-                if (filtersStart != std::string::npos) {
-                    filtersStart = convLayersStr.find('[', filtersStart);
-                    int filterDepth = 0;
-                    size_t filtersEnd = filtersStart;
-                    do {
-                        if (convLayersStr[filtersEnd] == '[') filterDepth++;
-                        if (convLayersStr[filtersEnd] == ']') filterDepth--;
-                        filtersEnd++;
-                    } while (filterDepth > 0);
-                    
-                    std::string filtersStr = convLayersStr.substr(filtersStart, filtersEnd - filtersStart);
-                    
-                    // Parse each filter
-                    size_t filterPos = 1;
-                    size_t filterIdx = 0;
-                    int fDepth = 0;
-                    
-                    while (filterPos < filtersStr.length() && filterIdx < FConvLayers[convLayerIdx]->Filters.size()) {
-                        if (filtersStr[filterPos] == '{') {
-                            if (fDepth == 0) {
-                                size_t weightsStart = filtersStr.find("\"weights\":", filterPos);
-                                size_t weightsValStart = filtersStr.find('[', weightsStart);
-                                int wDepth = 0;
-                                size_t weightsEnd = weightsValStart;
-                                do {
-                                    if (filtersStr[weightsEnd] == '[') wDepth++;
-                                    if (filtersStr[weightsEnd] == ']') wDepth--;
-                                    weightsEnd++;
-                                } while (wDepth > 0);
-                                
-                                std::string weightsStr = filtersStr.substr(weightsValStart, weightsEnd - weightsValStart);
-                                FConvLayers[convLayerIdx]->Filters[filterIdx]->Weights = parseArray4D(weightsStr);
-                                
-                                size_t biasStart = filtersStr.find("\"bias\":", filterPos);
-                                size_t biasValStart = biasStart + 7;
-                                while (filtersStr[biasValStart] == ' ') biasValStart++;
-                                size_t biasEnd = filtersStr.find_first_of(",\n}", biasValStart);
-                                FConvLayers[convLayerIdx]->Filters[filterIdx]->Bias =
-                                    std::stof(filtersStr.substr(biasValStart, biasEnd - biasValStart));
-                                
-                                filterIdx++;
-                            }
-                            fDepth++;
-                        } else if (filtersStr[filterPos] == '}') {
-                            fDepth--;
-                        }
-                        filterPos++;
-                    }
-                    
-                    convPos = filtersEnd + convPos;
-                    convLayerIdx++;
-                }
-            }
-            if (convLayersStr[convPos] == '{') convDepth++;
-            if (convLayersStr[convPos] == '}') convDepth--;
-            convPos++;
         }
-        
-        // Load fully connected layers
-        std::string fcLayersStr = findValue("fc_layers");
-        size_t fcPos = 1;
-        size_t fcLayerIdx = 0;
-        int fcDepth = 0;
-        
-        while (fcPos < fcLayersStr.length() && fcLayerIdx < FFullyConnectedLayers.size()) {
-            if (fcLayersStr[fcPos] == '{') {
-                if (fcDepth == 0) {
-                    size_t weightsStart = fcLayersStr.find("\"weights\":", fcPos);
-                    size_t weightsValStart = fcLayersStr.find('[', weightsStart);
-                    int wDepth = 0;
-                    size_t weightsEnd = weightsValStart;
-                    do {
-                        if (fcLayersStr[weightsEnd] == '[') wDepth++;
-                        if (fcLayersStr[weightsEnd] == ']') wDepth--;
-                        weightsEnd++;
-                    } while (wDepth > 0);
-                    
-                    std::string weightsStr = fcLayersStr.substr(weightsValStart, weightsEnd - weightsValStart);
-                    FFullyConnectedLayers[fcLayerIdx]->W = parseArray2D(weightsStr);
-                    
-                    size_t biasStart = fcLayersStr.find("\"bias\":", fcPos);
-                    size_t biasValStart = fcLayersStr.find('[', biasStart);
-                    int bDepth = 0;
-                    size_t biasEnd = biasValStart;
-                    do {
-                        if (fcLayersStr[biasEnd] == '[') bDepth++;
-                        if (fcLayersStr[biasEnd] == ']') bDepth--;
-                        biasEnd++;
-                    } while (bDepth > 0);
-                    
-                    std::string biasStr = fcLayersStr.substr(biasValStart, biasEnd - biasValStart);
-                    FFullyConnectedLayers[fcLayerIdx]->B = parseArray1D(biasStr);
-                    
-                    fcLayerIdx++;
-                }
-                fcDepth++;
-            } else if (fcLayersStr[fcPos] == '}') {
-                fcDepth--;
-            }
-            fcPos++;
-        }
-        
-        // Load output layer
-        std::string outputLayerStr = findValue("output_layer");
-        
-        size_t weightsStart = outputLayerStr.find("\"weights\":");
-        size_t weightsValStart = outputLayerStr.find('[', weightsStart);
-        int wDepth = 0;
-        size_t weightsEnd = weightsValStart;
-        do {
-            if (outputLayerStr[weightsEnd] == '[') wDepth++;
-            if (outputLayerStr[weightsEnd] == ']') wDepth--;
-            weightsEnd++;
-        } while (wDepth > 0);
-        
-        std::string weightsStr = outputLayerStr.substr(weightsValStart, weightsEnd - weightsValStart);
-        FOutputLayer->W = parseArray2D(weightsStr);
-        
-        size_t biasStart = outputLayerStr.find("\"bias\":");
-        size_t biasValStart = outputLayerStr.find('[', biasStart);
-        int bDepth = 0;
-        size_t biasEnd = biasValStart;
-        do {
-            if (outputLayerStr[biasEnd] == '[') bDepth++;
-            if (outputLayerStr[biasEnd] == ']') bDepth--;
-            biasEnd++;
-        } while (bDepth > 0);
-        
-        std::string biasStr = outputLayerStr.substr(biasValStart, biasEnd - biasValStart);
-        FOutputLayer->B = parseArray1D(biasStr);
+        if (convLayersStr[convPos] == '{') convDepth++;
+        if (convLayersStr[convPos] == '}') convDepth--;
+        convPos++;
     }
-};
+
+    // Load fully connected layers
+    std::string fcLayersStr = findValue("fc_layers");
+    size_t fcPos = 1;
+    size_t fcLayerIdx = 0;
+    int fcDepth = 0;
+
+    while (fcPos < fcLayersStr.length() && fcLayerIdx < FFullyConnectedLayers.size()) {
+        if (fcLayersStr[fcPos] == '{') {
+            if (fcDepth == 0) {
+                size_t weightsStart = fcLayersStr.find("\"weights\":", fcPos);
+                size_t weightsValStart = fcLayersStr.find('[', weightsStart);
+                int wDepth = 0;
+                size_t weightsEnd = weightsValStart;
+                do {
+                    if (fcLayersStr[weightsEnd] == '[') wDepth++;
+                    if (fcLayersStr[weightsEnd] == ']') wDepth--;
+                    weightsEnd++;
+                } while (wDepth > 0);
+
+                std::string weightsStr = fcLayersStr.substr(weightsValStart, weightsEnd - weightsValStart);
+                FFullyConnectedLayers[fcLayerIdx]->W = parseArray2D(weightsStr);
+
+                size_t biasStart = fcLayersStr.find("\"bias\":", fcPos);
+                size_t biasValStart = fcLayersStr.find('[', biasStart);
+                int bDepth = 0;
+                size_t biasEnd = biasValStart;
+                do {
+                    if (fcLayersStr[biasEnd] == '[') bDepth++;
+                    if (fcLayersStr[biasEnd] == ']') bDepth--;
+                    biasEnd++;
+                } while (bDepth > 0);
+
+                std::string biasStr = fcLayersStr.substr(biasValStart, biasEnd - biasValStart);
+                FFullyConnectedLayers[fcLayerIdx]->B = parseArray1D(biasStr);
+
+                fcLayerIdx++;
+            }
+            fcDepth++;
+        } else if (fcLayersStr[fcPos] == '}') {
+            fcDepth--;
+        }
+        fcPos++;
+    }
+
+    // Load output layer
+    std::string outputLayerStr = findValue("output_layer");
+
+    size_t weightsStart = outputLayerStr.find("\"weights\":");
+    size_t weightsValStart = outputLayerStr.find('[', weightsStart);
+    int wDepth = 0;
+    size_t weightsEnd = weightsValStart;
+    do {
+        if (outputLayerStr[weightsEnd] == '[') wDepth++;
+        if (outputLayerStr[weightsEnd] == ']') wDepth--;
+        weightsEnd++;
+    } while (wDepth > 0);
+
+    std::string weightsStr = outputLayerStr.substr(weightsValStart, weightsEnd - weightsValStart);
+    FOutputLayer->W = parseArray2D(weightsStr);
+
+    size_t biasStart = outputLayerStr.find("\"bias\":");
+    size_t biasValStart = outputLayerStr.find('[', biasStart);
+    int bDepth = 0;
+    size_t biasEnd = biasValStart;
+    do {
+        if (outputLayerStr[biasEnd] == '[') bDepth++;
+        if (outputLayerStr[biasEnd] == ']') bDepth--;
+        biasEnd++;
+    } while (bDepth > 0);
+
+    std::string biasStr = outputLayerStr.substr(biasValStart, biasEnd - biasValStart);
+    FOutputLayer->B = parseArray1D(biasStr);
+}
+
+// ========== CLI Helper Functions ==========
+
+void PrintHelp() {
+    std::cout << "Commands:\n";
+    std::cout << "  create   Create a new CNN model and save to JSON\n";
+    std::cout << "  train    Train an existing model with data from JSON\n";
+    std::cout << "  predict  Make predictions with a trained model from JSON\n";
+    std::cout << "  info     Display model information from JSON\n";
+    std::cout << "  help     Show this help message\n\n";
+    std::cout << "Create Options:\n";
+    std::cout << "  --input-w=N            Input width (required)\n";
+    std::cout << "  --input-h=N            Input height (required)\n";
+    std::cout << "  --input-c=N            Input channels (required)\n";
+    std::cout << "  --conv=N,N,...         Conv filters (required)\n";
+    std::cout << "  --kernels=N,N,...      Kernel sizes (required)\n";
+    std::cout << "  --pools=N,N,...        Pool sizes (required)\n";
+    std::cout << "  --fc=N,N,...           FC layer sizes (required)\n";
+    std::cout << "  --output=N             Output layer size (required)\n";
+    std::cout << "  --save=FILE.json       Save model to JSON file (required)\n";
+    std::cout << "  --lr=VALUE             Learning rate (default: 0.001)\n";
+    std::cout << "  --hidden-act=TYPE      sigmoid|tanh|relu|linear (default: relu)\n";
+    std::cout << "  --output-act=TYPE      sigmoid|tanh|relu|linear (default: linear)\n";
+    std::cout << "  --loss=TYPE            mse|crossentropy (default: mse)\n";
+    std::cout << "  --clip=VALUE           Gradient clipping (default: 5.0)\n\n";
+    std::cout << "Train Options:\n";
+    std::cout << "  --model=FILE.json      Load model from JSON file (required)\n";
+    std::cout << "  --data=FILE.csv        Training data CSV file (required)\n";
+    std::cout << "  --epochs=N             Number of epochs (required)\n";
+    std::cout << "  --save=FILE.json       Save trained model to JSON (required)\n";
+    std::cout << "  --batch-size=N         Batch size (default: 32)\n\n";
+    std::cout << "Predict Options:\n";
+    std::cout << "  --model=FILE.json      Load model from JSON file (required)\n";
+    std::cout << "  --data=FILE.csv        Input data CSV file (required)\n";
+    std::cout << "  --output=FILE.csv      Save predictions to CSV file (required)\n\n";
+    std::cout << "Info Options:\n";
+    std::cout << "  --model=FILE.json      Load model from JSON file (required)\n\n";
+    std::cout << "Examples:\n";
+    std::cout << "  cnn create --input-w=28 --input-h=28 --input-c=1 --conv=32,64 --kernels=3,3 --pools=2,2 --fc=128 --output=10 --save=model.json\n";
+    std::cout << "  cnn train --model=model.json --data=data.csv --epochs=50 --save=model_trained.json\n";
+    std::cout << "  cnn predict --model=model_trained.json --data=test.csv --output=predictions.csv\n";
+    std::cout << "  cnn info --model=model.json\n";
+}
+
+void PrintModelInfo(const std::string& modelFile) {
+    std::ifstream file(modelFile);
+    if (!file.is_open()) {
+        std::cerr << "Error: Cannot open model file: " << modelFile << std::endl;
+        return;
+    }
+
+    std::string content((std::istreambuf_iterator<char>(file)),
+                        std::istreambuf_iterator<char>());
+    file.close();
+
+    auto findValue = [&content](const std::string& key) -> std::string {
+        std::string searchKey = "\"" + key + "\": ";
+        size_t pos = content.find(searchKey);
+        if (pos == std::string::npos) return "";
+        pos += searchKey.length();
+        while (pos < content.length() && (content[pos] == ' ' || content[pos] == '\n')) pos++;
+        size_t endPos = pos;
+        while (endPos < content.length() && content[endPos] != ',' &&
+            content[endPos] != '\n' && content[endPos] != '}') endPos++;
+        return content.substr(pos, endPos - pos);
+    };
+
+    std::cout << "\n=================================================================\n";
+    std::cout << "  Model Information:  " << modelFile << "\n";
+    std::cout << "=================================================================\n\n";
+    std::cout << "Architecture:\n";
+    std::cout << "Input: " << findValue("input_width") << "x"
+    << findValue("input_height") << "x"
+    << findValue("input_channels") << "\n";
+    std::cout << "Output size: " << findValue("output_size") << "\n\n";
+    std::cout << "Training Parameters:\n";
+    std::cout << "Learning rate: " << findValue("learning_rate") << "\n";
+    std::cout << "Gradient clip: " << findValue("gradient_clip") << "\n";
+    std::cout << "activation: " << findValue("activation") << "\n";
+    std::cout << "output_activation: " << findValue("output_activation") << "\n";
+    std::cout << "loss_type: " << findValue("loss_type") << "\n\n";
+}
+
+std::vector<int> ParseIntList(const std::string& str) {
+    std::vector<int> result;
+    std::istringstream iss(str);
+    std::string token;
+    while (std::getline(iss, token, ',')) {
+        result.push_back(std::stoi(token));
+    }
+    return result;
+}
+
+std::string GetArgValue(int argc, char* argv[], const std::string& arg, const std::string& defaultValue = "") {
+    // Handle both --key=value and --key value formats
+    std::string searchKey = arg + "=";
+    
+    for (int i = 1; i < argc; i++) {
+        std::string argv_str(argv[i]);
+        
+        // Check for --key=value format
+        if (argv_str.substr(0, searchKey.length()) == searchKey) {
+            return argv_str.substr(searchKey.length());
+        }
+        
+        // Check for --key value format
+        if (argv_str == arg && i + 1 < argc) {
+            return std::string(argv[i + 1]);
+        }
+    }
+    return defaultValue;
+}
+
+bool HasArg(int argc, char* argv[], const std::string& arg) {
+    for (int i = 1; i < argc; i++) {
+        if (std::string(argv[i]) == arg) {
+            return true;
+        }
+    }
+    return false;
+}
+
+TActivationType ParseActivationType(const std::string& str) {
+    if (str == "sigmoid") return TActivationType::atSigmoid;
+    if (str == "tanh") return TActivationType::atTanh;
+    if (str == "relu") return TActivationType::atReLU;
+    if (str == "linear") return TActivationType::atLinear;
+    return TActivationType::atReLU;  // default
+}
+
+TLossType ParseLossType(const std::string& str) {
+    if (str == "mse") return TLossType::ltMSE;
+    if (str == "crossentropy") return TLossType::ltCrossEntropy;
+    return TLossType::ltCrossEntropy;  // default
+}
+
+TCommand ParseCommand(const std::string& cmd) {
+    if (cmd == "help") return TCommand::cmdHelp;
+    if (cmd == "info") return TCommand::cmdInfo;
+    if (cmd == "create") return TCommand::cmdCreate;
+    if (cmd == "train") return TCommand::cmdTrain;
+    if (cmd == "predict") return TCommand::cmdPredict;
+    return TCommand::cmdNone;
+}
+
+std::string ActivationTypeToStr(TActivationType act) {
+    switch (act) {
+        case TActivationType::atSigmoid: return "sigmoid";
+        case TActivationType::atTanh: return "tanh";
+        case TActivationType::atReLU: return "relu";
+        case TActivationType::atLinear: return "linear";
+        default: return "unknown";
+    }
+}
+
+std::string LossTypeToStr(TLossType loss) {
+    switch (loss) {
+        case TLossType::ltMSE: return "mse";
+        case TLossType::ltCrossEntropy: return "crossentropy";
+        default: return "unknown";
+    }
+}
+
+void HandleCreate(int argc, char* argv[]) {
+     std::string saveFile = GetArgValue(argc, argv, "--save", "");
+     std::string inputWStr = GetArgValue(argc, argv, "--input-w", "");
+     std::string inputHStr = GetArgValue(argc, argv, "--input-h", "");
+     std::string inputCStr = GetArgValue(argc, argv, "--input-c", "");
+     std::string convFilters = GetArgValue(argc, argv, "--conv", "");
+     std::string kernels = GetArgValue(argc, argv, "--kernels", "");
+     std::string pools = GetArgValue(argc, argv, "--pools", "");
+     std::string fcLayers = GetArgValue(argc, argv, "--fc", "");
+     std::string outputSizeStr = GetArgValue(argc, argv, "--output", "");
+
+     // Validate required arguments
+     if (saveFile.empty()) {
+         std::cerr << "Error: --save argument is required for create command" << std::endl;
+         return;
+     }
+     if (inputWStr.empty()) {
+         std::cerr << "Error: --input-w argument is required for create command" << std::endl;
+         return;
+     }
+     if (inputHStr.empty()) {
+         std::cerr << "Error: --input-h argument is required for create command" << std::endl;
+         return;
+     }
+     if (inputCStr.empty()) {
+         std::cerr << "Error: --input-c argument is required for create command" << std::endl;
+         return;
+     }
+     if (convFilters.empty()) {
+         std::cerr << "Error: --conv argument is required for create command" << std::endl;
+         return;
+     }
+     if (kernels.empty()) {
+         std::cerr << "Error: --kernels argument is required for create command" << std::endl;
+         return;
+     }
+     if (pools.empty()) {
+         std::cerr << "Error: --pools argument is required for create command" << std::endl;
+         return;
+     }
+     if (fcLayers.empty()) {
+         std::cerr << "Error: --fc argument is required for create command" << std::endl;
+         return;
+     }
+     if (outputSizeStr.empty()) {
+         std::cerr << "Error: --output argument is required for create command" << std::endl;
+         return;
+     }
+
+     int inputW = std::stoi(inputWStr);
+     int inputH = std::stoi(inputHStr);
+     int inputC = std::stoi(inputCStr);
+     int outputSize = std::stoi(outputSizeStr);
+
+     std::string hiddenActStr = GetArgValue(argc, argv, "--hidden-act", "relu");
+     std::string outputActStr = GetArgValue(argc, argv, "--output-act", "linear");
+     std::string lossStr = GetArgValue(argc, argv, "--loss", "mse");
+     double lr = std::stod(GetArgValue(argc, argv, "--lr", "0.001"));
+     double clip = std::stod(GetArgValue(argc, argv, "--clip", "5.0"));
+
+     std::vector<int> convFilterVec = ParseIntList(convFilters);
+     std::vector<int> kernelVec = ParseIntList(kernels);
+     std::vector<int> poolVec = ParseIntList(pools);
+     std::vector<int> fcVec = ParseIntList(fcLayers);
+
+    TActivationType hiddenAct = ParseActivationType(hiddenActStr);
+    TActivationType outputAct = ParseActivationType(outputActStr);
+    TLossType lossType = ParseLossType(lossStr);
+
+    std::cout << "Creating CNN model...\n";
+    std::cout << "  Input: " << inputW << "x" << inputH << "x" << inputC << "\n";
+    
+    std::cout << "  Conv filters: ";
+    for (size_t i = 0; i < convFilterVec.size(); i++) {
+        if (i > 0) std::cout << ",";
+        std::cout << convFilterVec[i];
+    }
+    std::cout << "\n";
+    
+    std::cout << "  Kernel sizes: ";
+    for (size_t i = 0; i < kernelVec.size(); i++) {
+        if (i > 0) std::cout << ",";
+        std::cout << kernelVec[i];
+    }
+    std::cout << "\n";
+    
+    std::cout << "  Pool sizes: ";
+    for (size_t i = 0; i < poolVec.size(); i++) {
+        if (i > 0) std::cout << ",";
+        std::cout << poolVec[i];
+    }
+    std::cout << "\n";
+    
+    std::cout << "  FC layers: ";
+    for (size_t i = 0; i < fcVec.size(); i++) {
+       if (i > 0) std::cout << ",";
+       std::cout << fcVec[i];
+    }
+    std::cout << "\n";
+    
+    std::cout << "Output size: " << outputSize << "\n";
+    std::cout << "  Hidden activation: " << ActivationTypeToStr(hiddenAct) << "\n";
+    std::cout << "  Output activation: " << ActivationTypeToStr(outputAct) << "\n";
+    std::cout << "  Loss function: " << LossTypeToStr(lossType) << "\n";
+    std::cout << std::fixed << std::setprecision(6) << "  Learning rate: " << lr << "\n";
+    std::cout << std::fixed << std::setprecision(2) << "  Gradient clip: " << clip << "\n";
+
+    TAdvancedCNN* cnn = new TAdvancedCNN(
+        inputW, inputH, inputC,
+        convFilterVec, kernelVec, poolVec, fcVec,
+        outputSize, hiddenAct, outputAct,
+        lossType, lr, clip
+    );
+
+    cnn->SaveModelToJSON(saveFile);
+    std::cout << "Created CNN model\n";
+    std::cout << "Model saved to: " << saveFile << "\n";
+
+    delete cnn;
+}
+
+void HandleTrain(int argc, char* argv[]) {
+    std::string modelFile = GetArgValue(argc, argv, "--model", "");
+    std::string dataFile = GetArgValue(argc, argv, "--data", "");
+    std::string epochsStr = GetArgValue(argc, argv, "--epochs", "");
+    std::string saveFile = GetArgValue(argc, argv, "--save", "");
+    int batchSize = std::stoi(GetArgValue(argc, argv, "--batch-size", "32"));
+
+    // Validate required arguments
+    if (modelFile.empty()) {
+        std::cerr << "Error: --model argument is required for train command" << std::endl;
+        return;
+    }
+    if (dataFile.empty()) {
+        std::cerr << "Error: --data argument is required for train command" << std::endl;
+        return;
+    }
+    if (epochsStr.empty()) {
+        std::cerr << "Error: --epochs argument is required for train command" << std::endl;
+        return;
+    }
+    if (saveFile.empty()) {
+        std::cerr << "Error: --save argument is required for train command" << std::endl;
+        return;
+    }
+
+    int epochs = std::stoi(epochsStr);
+
+    std::cout << "Training model...\n";
+    std::cout << "  Model: " << modelFile << "\n";
+    std::cout << "  Data: " << dataFile << "\n";
+    std::cout << "  Epochs: " << epochs << "\n";
+    std::cout << "  Batch size: " << batchSize << "\n";
+    std::cout << "  Save to: " << saveFile << "\n\n";
+
+    std::cout << "Training not fully implemented in this CLI demo.\n";
+    std::cout << "To implement training:\n";
+    std::cout << "  1. Load CSV data from " << dataFile << "\n";
+    std::cout << "  2. Load model from " << modelFile << "\n";
+    std::cout << "  3. Run training loop with TrainBatch() for " << epochs << " epochs\n";
+    std::cout << "  4. Save updated model to " << saveFile << "\n";
+    std::cout << "\nSee the library API for complete training implementation.\n";
+}
+
+void HandlePredict(int argc, char* argv[]) {
+    std::string modelFile = GetArgValue(argc, argv, "--model", "");
+    std::string dataFile = GetArgValue(argc, argv, "--data", "");
+    std::string outputFile = GetArgValue(argc, argv, "--output", "");
+
+    // Validate required arguments
+    if (modelFile.empty()) {
+        std::cerr << "Error: --model argument is required for predict command" << std::endl;
+        return;
+    }
+    if (dataFile.empty()) {
+        std::cerr << "Error: --data argument is required for predict command" << std::endl;
+        return;
+    }
+    if (outputFile.empty()) {
+        std::cerr << "Error: --output argument is required for predict command" << std::endl;
+        return;
+    }
+
+    std::cout << "Making predictions...\n";
+    std::cout << "  Model: " << modelFile << "\n";
+    std::cout << "  Data: " << dataFile << "\n";
+    std::cout << "  Output: " << outputFile << "\n\n";
+
+    std::cout << "Prediction not fully implemented in this CLI demo.\n";
+    std::cout << "To implement prediction:\n";
+    std::cout << "  1. Load model from " << modelFile << "\n";
+    std::cout << "  2. Load input data from CSV file: " << dataFile << "\n";
+    std::cout << "  3. Run Predict() on each input\n";
+    std::cout << "  4. Save predictions to CSV: " << outputFile << "\n";
+    std::cout << "\nSee the library API for complete prediction implementation.\n";
+}
 
 // ========== Main Program ==========
 int main(int argc, char* argv[]) {
-    srand(time(0));
-    
+    // Seed random number generator
+    std::srand(static_cast<unsigned int>(std::time(nullptr)));
+
     if (argc < 2) {
-        PrintUsage();
+        PrintHelp();
         return 0;
     }
-    
-    string CmdStr = argv[1];
-    Command Cmd = cmdNone;
-    
-    if (CmdStr == "create") Cmd = cmdCreate;
-    else if (CmdStr == "train") Cmd = cmdTrain;
-    else if (CmdStr == "predict") Cmd = cmdPredict;
-    else if (CmdStr == "info") Cmd = cmdInfo;
-    else if (CmdStr == "help" || CmdStr == "--help" || CmdStr == "-h") Cmd = cmdHelp;
-    else {
-        cerr << "Unknown command: " << CmdStr << "\n";
-        PrintUsage();
+
+    // Handle --help flag
+    if (std::string(argv[1]) == "--help" || std::string(argv[1]) == "-h") {
+        PrintHelp();
+        return 0;
+    }
+
+    TCommand cmd = ParseCommand(argv[1]);
+
+    try {
+        switch (cmd) {
+            case TCommand::cmdHelp:
+                PrintHelp();
+                break;
+
+            case TCommand::cmdInfo: {
+                std::string modelFile = GetArgValue(argc, argv, "--model", "");
+                if (modelFile.empty()) {
+                    std::cerr << "Error: --model argument required for info command\n";
+                    return 1;
+                }
+                PrintModelInfo(modelFile);
+                break;
+            }
+
+            case TCommand::cmdCreate:
+                HandleCreate(argc, argv);
+                break;
+
+            case TCommand::cmdTrain:
+                HandleTrain(argc, argv);
+                break;
+
+            case TCommand::cmdPredict:
+                HandlePredict(argc, argv);
+                break;
+
+            case TCommand::cmdNone:
+            default:
+                std::cerr << "Error: Unknown command '" << argv[1] << "'\n";
+                std::cerr << "Run 'CNN help' for usage information\n";
+                return 1;
+        }
+    } catch (const std::exception& e) {
+        std::cerr << "Error: " << e.what() << std::endl;
         return 1;
     }
-    
-    if (Cmd == cmdHelp) {
-        PrintUsage();
-        return 0;
-    }
-    
-    // Initialize defaults
-    int inputW = 0, inputH = 0, inputC = 0, outputSize = 0;
-    TIntArray convFilters, kernelSizes, poolSizes, fcLayerSizes;
-    double learningRate = 0.001;
-    double gradientClip = 5.0;
-    ActivationType hiddenAct = atReLU;
-    ActivationType outputAct = atLinear;
-    LossType lossType = ltMSE;
-    string modelFile = "";
-    string saveFile = "";
-    
-    // Parse arguments
-    for (int i = 2; i < argc; i++) {
-        string arg = argv[i];
-        size_t eqPos = arg.find('=');
-        if (eqPos == string::npos) {
-            cerr << "Invalid argument: " << arg << "\n";
-            continue;
-        }
-        
-        string key = arg.substr(0, eqPos);
-        string value = arg.substr(eqPos + 1);
-        
-        if (key == "--input-w") inputW = stoi(value);
-        else if (key == "--input-h") inputH = stoi(value);
-        else if (key == "--input-c") inputC = stoi(value);
-        else if (key == "--output") outputSize = stoi(value);
-        else if (key == "--conv") ParseIntArrayHelper(value, convFilters);
-        else if (key == "--kernels") ParseIntArrayHelper(value, kernelSizes);
-        else if (key == "--pools") ParseIntArrayHelper(value, poolSizes);
-        else if (key == "--fc") ParseIntArrayHelper(value, fcLayerSizes);
-        else if (key == "--save") saveFile = value;
-        else if (key == "--model") modelFile = value;
-        else if (key == "--lr") learningRate = stod(value);
-        else if (key == "--hidden-act") hiddenAct = ParseActivation(value);
-        else if (key == "--output-act") outputAct = ParseActivation(value);
-        else if (key == "--loss") lossType = ParseLoss(value);
-        else if (key == "--clip") gradientClip = stod(value);
-        else cerr << "Unknown option: " << key << "\n";
-    }
-    
-    // Execute command
-    if (Cmd == cmdCreate) {
-        if (inputW <= 0) { cerr << "Error: --input-w is required\n"; return 1; }
-        if (inputH <= 0) { cerr << "Error: --input-h is required\n"; return 1; }
-        if (inputC <= 0) { cerr << "Error: --input-c is required\n"; return 1; }
-        if (convFilters.empty()) { cerr << "Error: --conv is required\n"; return 1; }
-        if (kernelSizes.empty()) { cerr << "Error: --kernels is required\n"; return 1; }
-        if (poolSizes.empty()) { cerr << "Error: --pools is required\n"; return 1; }
-        if (fcLayerSizes.empty()) { cerr << "Error: --fc is required\n"; return 1; }
-        if (outputSize <= 0) { cerr << "Error: --output is required\n"; return 1; }
-        if (saveFile.empty()) { cerr << "Error: --save is required\n"; return 1; }
-        
-        TAdvancedCNNOpenCL* CNN = new TAdvancedCNNOpenCL(inputW, inputH, inputC, convFilters, kernelSizes,
-                                                         poolSizes, fcLayerSizes, outputSize,
-                                                         hiddenAct, outputAct, lossType, 
-                                                         learningRate, gradientClip);
-        
-        cout << "Created CNN model (OpenCL):\n";
-        cout << "  Input: " << inputW << "x" << inputH << "x" << inputC << "\n";
-        
-        cout << "  Conv filters: ";
-        for (size_t i = 0; i < convFilters.size(); i++) {
-            if (i > 0) cout << ",";
-            cout << convFilters[i];
-        }
-        cout << "\n";
-        
-        cout << "  Kernel sizes: ";
-        for (size_t i = 0; i < kernelSizes.size(); i++) {
-            if (i > 0) cout << ",";
-            cout << kernelSizes[i];
-        }
-        cout << "\n";
-        
-        cout << "  Pool sizes: ";
-        for (size_t i = 0; i < poolSizes.size(); i++) {
-            if (i > 0) cout << ",";
-            cout << poolSizes[i];
-        }
-        cout << "\n";
-        
-        cout << "  FC layers: ";
-        for (size_t i = 0; i < fcLayerSizes.size(); i++) {
-            if (i > 0) cout << ",";
-            cout << fcLayerSizes[i];
-        }
-        cout << "\n";
-        
-        cout << "  Output size: " << outputSize << "\n";
-        cout << "  Hidden activation: " << ActivationToStr(hiddenAct) << "\n";
-        cout << "  Output activation: " << ActivationToStr(outputAct) << "\n";
-        cout << "  Loss function: " << LossToStr(lossType) << "\n";
-        cout << "  Learning rate: " << fixed << setprecision(6) << learningRate << "\n";
-        cout << "  Gradient clip: " << fixed << setprecision(2) << gradientClip << "\n";
-        cout << "  Saved to: " << saveFile << "\n";
-        
-        delete CNN;
-    }
-    else if (Cmd == cmdTrain) {
-        cout << "Train command requires model persistence (not yet implemented)\n";
-    }
-    else if (Cmd == cmdPredict) {
-        cout << "Predict command requires model persistence (not yet implemented)\n";
-    }
-    else if (Cmd == cmdInfo) {
-        cout << "Info command requires model persistence (not yet implemented)\n";
-    }
-    
+
     return 0;
 }
