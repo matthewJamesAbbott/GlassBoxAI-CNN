@@ -1,8 +1,26 @@
-//
-// Matthew Abbott 2025
-// Advanced CNN with Full Backpropagation, Adam Optimizer, Batch Processing
-// CUDA Implementation
-//
+/*
+ * MIT License
+ * 
+ * Copyright (c) 2025 Matthew Abbott
+ * 
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ * 
+ * The above copyright notice and this permission notice shall be included in all
+ * copies or substantial portions of the Software.
+ * 
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
+ */
 
 #include <cuda_runtime.h>
 #include <curand.h>
@@ -643,9 +661,13 @@ class TConvolutionalNeuralNetworkCUDA {
 private:
     double LearningRate;
     double DropoutRate;
+    double GradientClip;
     double Beta1, Beta2;
     int AdamT;
     bool IsTraining;
+    ActivationType HiddenActivation;
+    ActivationType OutputActivation;
+    LossType LossFunction;
 
     std::vector<ConvLayerGPU> ConvLayers;
     std::vector<PoolLayerGPU> PoolLayers;
@@ -690,13 +712,17 @@ public:
                                     const std::vector<int>& poolSizes,
                                     const std::vector<int>& fcSizes,
                                     int outputSize,
+                                    ActivationType hiddenAct,
+                                    ActivationType outputAct,
+                                    LossType lossType,
                                     double learningRate = 0.001,
-                                    double dropoutRate = 0.25);
+                                    double gradientClip = 5.0);
     ~TConvolutionalNeuralNetworkCUDA();
 
     void Predict(const double* imageData, double* result);
     double TrainStep(const double* imageData, const double* target);
     bool Save(const char* filename);
+    bool SaveToJSON(const char* filename);
     static TConvolutionalNeuralNetworkCUDA* Load(const char* filename);
 
     int GetInputWidth() const { return InputWidth; }
@@ -706,7 +732,10 @@ public:
     int GetNumConvLayers() const { return ConvLayers.size(); }
     int GetNumFCLayers() const { return FCLayers.size(); }
     double GetLearningRate() const { return LearningRate; }
-    double GetDropoutRate() const { return DropoutRate; }
+    double GetGradientClip() const { return GradientClip; }
+    ActivationType GetHiddenActivation() const { return HiddenActivation; }
+    ActivationType GetOutputActivation() const { return OutputActivation; }
+    LossType GetLossType() const { return LossFunction; }
     const std::vector<int>& GetConvFilters() const { return FConvFilters; }
     const std::vector<int>& GetKernelSizes() const { return FKernelSizes; }
     const std::vector<int>& GetPoolSizes() const { return FPoolSizes; }
@@ -845,11 +874,18 @@ TConvolutionalNeuralNetworkCUDA::TConvolutionalNeuralNetworkCUDA(
     const std::vector<int>& poolSizes,
     const std::vector<int>& fcSizes,
     int outputSize,
+    ActivationType hiddenAct,
+    ActivationType outputAct,
+    LossType lossType,
     double learningRate,
-    double dropoutRate)
+    double gradientClip)
 {
     LearningRate = learningRate;
-    DropoutRate = dropoutRate;
+    GradientClip = gradientClip;
+    DropoutRate = 0.0;
+    HiddenActivation = hiddenAct;
+    OutputActivation = outputAct;
+    LossFunction = lossType;
     Beta1 = 0.9;
     Beta2 = 0.999;
     AdamT = 0;
@@ -1065,8 +1101,8 @@ double TConvolutionalNeuralNetworkCUDA::TrainStep(const double* imageData, const
         FCLayerGPU& fc = FCLayers[i];
         blocks = (fc.NumNeurons + BLOCK_SIZE - 1) / BLOCK_SIZE;
         FCBackwardKernel<<<blocks, BLOCK_SIZE>>>(fc.d_Errors, nullptr, d_FCGrad,
-                                                  fc.d_Weights, fc.d_PreActivation,
-                                                  fc.d_DropoutMask, fc.NumNeurons,
+                                                 fc.d_Weights, fc.d_PreActivation,
+                                                 fc.d_DropoutMask, fc.NumNeurons,
                                                   fc.NumInputs, false);
 
         prevOutput = (i > 0) ? FCLayers[i - 1].d_Output : d_FlattenedFeatures;
@@ -1319,6 +1355,183 @@ bool TConvolutionalNeuralNetworkCUDA::Save(const char* filename) {
     return true;
 }
 
+bool TConvolutionalNeuralNetworkCUDA::SaveToJSON(const char* filename) {
+    ofstream outFile(filename);
+    if (!outFile.is_open()) return false;
+    
+    auto ActivationToString = [](ActivationType a) -> string {
+        switch(a) {
+            case atReLU: return "relu";
+            case atSigmoid: return "sigmoid";
+            case atTanh: return "tanh";
+            case atLinear: return "linear";
+            default: return "relu";
+        }
+    };
+    
+    auto LossToString = [](LossType l) -> string {
+        switch(l) {
+            case ltMSE: return "mse";
+            case ltCrossEntropy: return "crossentropy";
+            default: return "mse";
+        }
+    };
+    
+    outFile << "{\n";
+    outFile << "  \"input_width\": " << InputWidth << ",\n";
+    outFile << "  \"input_height\": " << InputHeight << ",\n";
+    outFile << "  \"input_channels\": " << InputChannels << ",\n";
+    outFile << "  \"output_size\": " << OutputSize << ",\n";
+    
+    outFile << "  \"conv_filters\": [";
+    for (size_t i = 0; i < FConvFilters.size(); i++) {
+        if (i > 0) outFile << ", ";
+        outFile << FConvFilters[i];
+    }
+    outFile << "],\n";
+    
+    outFile << "  \"kernel_sizes\": [";
+    for (size_t i = 0; i < FKernelSizes.size(); i++) {
+        if (i > 0) outFile << ", ";
+        outFile << FKernelSizes[i];
+    }
+    outFile << "],\n";
+    
+    outFile << "  \"pool_sizes\": [";
+    for (size_t i = 0; i < FPoolSizes.size(); i++) {
+        if (i > 0) outFile << ", ";
+        outFile << FPoolSizes[i];
+    }
+    outFile << "],\n";
+    
+    outFile << "  \"fc_layer_sizes\": [";
+    for (size_t i = 0; i < FFCSizes.size(); i++) {
+        if (i > 0) outFile << ", ";
+        outFile << FFCSizes[i];
+    }
+    outFile << "],\n";
+    
+    outFile << fixed << setprecision(6);
+    outFile << "  \"learning_rate\": " << LearningRate << ",\n";
+    outFile << "  \"dropout_rate\": " << DropoutRate << ",\n";
+    outFile << "  \"activation\": \"" << ActivationToString(HiddenActivation) << "\",\n";
+    outFile << "  \"output_activation\": \"" << ActivationToString(OutputActivation) << "\",\n";
+    outFile << "  \"loss_type\": \"" << LossToString(LossFunction) << "\",\n";
+    
+    outFile << "  \"conv_layers\": [\n";
+    for (size_t i = 0; i < ConvLayers.size(); i++) {
+        auto& conv = ConvLayers[i];
+        int weightSize = conv.NumFilters * conv.InputChannels * conv.KernelSize * conv.KernelSize;
+        double* h_weights = new double[weightSize];
+        double* h_biases = new double[conv.NumFilters];
+        
+        CUDA_CHECK(cudaMemcpy(h_weights, conv.d_Weights, weightSize * sizeof(double), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(h_biases, conv.d_Biases, conv.NumFilters * sizeof(double), cudaMemcpyDeviceToHost));
+        
+        outFile << "    {\n";
+        outFile << "      \"filters\": [\n";
+        for (int f = 0; f < conv.NumFilters; f++) {
+            outFile << "        {\n";
+            outFile << "          \"bias\": " << h_biases[f] << ",\n";
+            outFile << "          \"weights\": [";
+            int filterOffset = f * conv.InputChannels * conv.KernelSize * conv.KernelSize;
+            for (int c = 0; c < conv.InputChannels; c++) {
+                if (c > 0) outFile << ", ";
+                outFile << "[";
+                for (int ky = 0; ky < conv.KernelSize; ky++) {
+                    if (ky > 0) outFile << ", ";
+                    outFile << "[";
+                    for (int kx = 0; kx < conv.KernelSize; kx++) {
+                        if (kx > 0) outFile << ", ";
+                        int idx = filterOffset + c * conv.KernelSize * conv.KernelSize + ky * conv.KernelSize + kx;
+                        outFile << h_weights[idx];
+                    }
+                    outFile << "]";
+                }
+                outFile << "]";
+            }
+            outFile << "]\n";
+            outFile << "        }" << (f < conv.NumFilters - 1 ? "," : "") << "\n";
+        }
+        outFile << "      ]\n";
+        outFile << "    }" << (i < ConvLayers.size() - 1 ? "," : "") << "\n";
+        
+        delete[] h_weights;
+        delete[] h_biases;
+    }
+    outFile << "  ],\n";
+    
+    outFile << "  \"pool_layers\": [\n";
+    for (size_t i = 0; i < PoolLayers.size(); i++) {
+        outFile << "    {\"poolSize\": " << PoolLayers[i].PoolSize << "}";
+        outFile << (i < PoolLayers.size() - 1 ? "," : "") << "\n";
+    }
+    outFile << "  ],\n";
+    
+    outFile << "  \"fc_layers\": [\n";
+    for (size_t i = 0; i < FCLayers.size(); i++) {
+        auto& fc = FCLayers[i];
+        int weightSize = fc.NumNeurons * fc.NumInputs;
+        double* h_weights = new double[weightSize];
+        double* h_biases = new double[fc.NumNeurons];
+        
+        CUDA_CHECK(cudaMemcpy(h_weights, fc.d_Weights, weightSize * sizeof(double), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(h_biases, fc.d_Biases, fc.NumNeurons * sizeof(double), cudaMemcpyDeviceToHost));
+        
+        outFile << "    {\n";
+        outFile << "      \"neurons\": [\n";
+        for (int j = 0; j < fc.NumNeurons; j++) {
+            outFile << "        {\n";
+            outFile << "          \"bias\": " << h_biases[j] << ",\n";
+            outFile << "          \"weights\": [";
+            for (int w = 0; w < fc.NumInputs; w++) {
+                if (w > 0) outFile << ", ";
+                outFile << h_weights[j * fc.NumInputs + w];
+            }
+            outFile << "]\n";
+            outFile << "        }" << (j < fc.NumNeurons - 1 ? "," : "") << "\n";
+        }
+        outFile << "      ]\n";
+        outFile << "    }" << (i < FCLayers.size() - 1 ? "," : "") << "\n";
+        
+        delete[] h_weights;
+        delete[] h_biases;
+    }
+    outFile << "  ],\n";
+    
+    outFile << "  \"output_layer\": {\n";
+    outFile << "    \"neurons\": [\n";
+    {
+        int weightSize = OutputLayer.NumNeurons * OutputLayer.NumInputs;
+        double* h_weights = new double[weightSize];
+        double* h_biases = new double[OutputLayer.NumNeurons];
+        
+        CUDA_CHECK(cudaMemcpy(h_weights, OutputLayer.d_Weights, weightSize * sizeof(double), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(h_biases, OutputLayer.d_Biases, OutputLayer.NumNeurons * sizeof(double), cudaMemcpyDeviceToHost));
+        
+        for (int j = 0; j < OutputLayer.NumNeurons; j++) {
+            outFile << "      {\n";
+            outFile << "        \"bias\": " << h_biases[j] << ",\n";
+            outFile << "        \"weights\": [";
+            for (int w = 0; w < OutputLayer.NumInputs; w++) {
+                if (w > 0) outFile << ", ";
+                outFile << h_weights[j * OutputLayer.NumInputs + w];
+            }
+            outFile << "]\n";
+            outFile << "      }" << (j < OutputLayer.NumNeurons - 1 ? "," : "") << "\n";
+        }
+        
+        delete[] h_weights;
+        delete[] h_biases;
+    }
+    outFile << "    ]\n";
+    outFile << "  }\n";
+    outFile << "}\n";
+    
+    outFile.close();
+    return true;
+}
+
 TConvolutionalNeuralNetworkCUDA* TConvolutionalNeuralNetworkCUDA::Load(const char* filename) {
     FILE* f = fopen(filename, "rb");
     if (!f) return nullptr;
@@ -1367,7 +1580,8 @@ TConvolutionalNeuralNetworkCUDA* TConvolutionalNeuralNetworkCUDA::Load(const cha
     TConvolutionalNeuralNetworkCUDA* cnn = new TConvolutionalNeuralNetworkCUDA(
         inputWidth, inputHeight, inputChannels,
         convFilters, kernelSizes, poolSizes, fcSizes, outputSize,
-        learningRate, dropoutRate);
+        atReLU, atLinear, ltMSE,
+        learningRate, 5.0);
 
     cnn->Beta1 = beta1;
     cnn->Beta2 = beta2;
@@ -1428,21 +1642,6 @@ TConvolutionalNeuralNetworkCUDA* TConvolutionalNeuralNetworkCUDA::Load(const cha
     return cnn;
 }
 
-// Helper functions
-void ParseIntArrayHelper(const string& s, TIntArray& result) {
-    result.clear();
-    stringstream ss(s);
-    string token;
-    while (getline(ss, token, ',')) {
-        // Trim whitespace
-        token.erase(0, token.find_first_not_of(" \t\r\n"));
-        token.erase(token.find_last_not_of(" \t\r\n") + 1);
-        if (!token.empty()) {
-            result.push_back(stoi(token));
-        }
-    }
-}
-
 // ========== Helper Functions ==========
 string ActivationToStr(ActivationType act) {
     switch (act) {
@@ -1478,14 +1677,62 @@ LossType ParseLoss(const string& s) {
     else return ltMSE;
 }
 
-void PrintUsage() {
-    cout << "CNN - Command-line Convolutional Neural Network\n";
-    cout << "Matthew Abbott 2025 \n\n";
+Command ParseCommand(const string& cmd) {
+    if (cmd == "help") return cmdHelp;
+    if (cmd == "info") return cmdInfo;
+    if (cmd == "create") return cmdCreate;
+    if (cmd == "train") return cmdTrain;
+    if (cmd == "predict") return cmdPredict;
+    return cmdNone;
+}
+
+vector<int> ParseIntList(const string& str) {
+    vector<int> result;
+    stringstream iss(str);
+    string token;
+    while (getline(iss, token, ',')) {
+        token.erase(0, token.find_first_not_of(" \t\r\n"));
+        token.erase(token.find_last_not_of(" \t\r\n") + 1);
+        if (!token.empty()) {
+            result.push_back(stoi(token));
+        }
+    }
+    return result;
+}
+
+string GetArgValue(int argc, char* argv[], const string& arg, const string& defaultValue = "") {
+    string searchKey = arg + "=";
+    
+    for (int i = 1; i < argc; i++) {
+        string argv_str(argv[i]);
+        
+        if (argv_str.substr(0, searchKey.length()) == searchKey) {
+            return argv_str.substr(searchKey.length());
+        }
+        
+        if (argv_str == arg && i + 1 < argc) {
+            return string(argv[i + 1]);
+        }
+    }
+    return defaultValue;
+}
+
+bool HasArg(int argc, char* argv[], const string& arg) {
+    for (int i = 1; i < argc; i++) {
+        if (string(argv[i]) == arg) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// ========== CLI Helper Functions ==========
+void PrintHelp() {
     cout << "Commands:\n";
-    cout << "  create   Create a new CNN model\n";
-    cout << "  train    Train an existing model with data\n";
-    cout << "  predict  Make predictions with a trained model\n";
-    cout << "  info     Display model information\n";
+    cout << "  create   Create a new CNN model and save to JSON\n";
+    cout << "  train    Train an existing model with data from JSON\n";
+    cout << "  predict  Make predictions with a trained model from JSON\n";
+    cout << "  info     Display model information from JSON\n";
     cout << "  help     Show this help message\n\n";
     cout << "Create Options:\n";
     cout << "  --input-w=N            Input width (required)\n";
@@ -1496,151 +1743,320 @@ void PrintUsage() {
     cout << "  --pools=N,N,...        Pool sizes (required)\n";
     cout << "  --fc=N,N,...           FC layer sizes (required)\n";
     cout << "  --output=N             Output layer size (required)\n";
-    cout << "  --save=FILE            Save model to file (required)\n";
+    cout << "  --save=FILE.json       Save model to JSON file (required)\n";
     cout << "  --lr=VALUE             Learning rate (default: 0.001)\n";
     cout << "  --hidden-act=TYPE      sigmoid|tanh|relu|linear (default: relu)\n";
     cout << "  --output-act=TYPE      sigmoid|tanh|relu|linear (default: linear)\n";
     cout << "  --loss=TYPE            mse|crossentropy (default: mse)\n";
     cout << "  --clip=VALUE           Gradient clipping (default: 5.0)\n\n";
+    cout << "Train Options:\n";
+    cout << "  --model=FILE.json      Load model from JSON file (required)\n";
+    cout << "  --data=FILE.csv        Training data CSV file (required)\n";
+    cout << "  --epochs=N             Number of epochs (required)\n";
+    cout << "  --save=FILE.json       Save trained model to JSON (required)\n";
+    cout << "  --batch-size=N         Batch size (default: 32)\n\n";
+    cout << "Predict Options:\n";
+    cout << "  --model=FILE.json      Load model from JSON file (required)\n";
+    cout << "  --data=FILE.csv        Input data CSV file (required)\n";
+    cout << "  --output=FILE.csv      Save predictions to CSV file (required)\n\n";
+    cout << "Info Options:\n";
+    cout << "  --model=FILE.json      Load model from JSON file (required)\n\n";
     cout << "Examples:\n";
-    cout << "  cnn create --input-w=28 --input-h=28 --input-c=1 --conv=32,64 --kernels=3,3 --pools=2,2 --fc=128 --output=10 --save=model.bin\n";
-    cout << "  cnn train --model=model.bin --data=data.csv --epochs=50 --save=model_trained.bin\n";
+    cout << "  cnn create --input-w=28 --input-h=28 --input-c=1 --conv=32,64 --kernels=3,3 --pools=2,2 --fc=128 --output=10 --save=model.json\n";
+    cout << "  cnn train --model=model.json --data=data.csv --epochs=50 --save=model_trained.json\n";
+    cout << "  cnn predict --model=model_trained.json --data=test.csv --output=predictions.csv\n";
+    cout << "  cnn info --model=model.json\n";
 }
 
+void PrintModelInfo(const string& modelFile) {
+    ifstream file(modelFile);
+    if (!file.is_open()) {
+        cerr << "Error: Cannot open model file: " << modelFile << endl;
+        return;
+    }
+
+    string content((istreambuf_iterator<char>(file)),
+                   istreambuf_iterator<char>());
+    file.close();
+
+    auto findValue = [&content](const string& key) -> string {
+        string searchKey = "\"" + key + "\": ";
+        size_t pos = content.find(searchKey);
+        if (pos == string::npos) return "";
+        pos += searchKey.length();
+        while (pos < content.length() && (content[pos] == ' ' || content[pos] == '\n')) pos++;
+        size_t endPos = pos;
+        while (endPos < content.length() && content[endPos] != ',' &&
+            content[endPos] != '\n' && content[endPos] != '}') endPos++;
+        return content.substr(pos, endPos - pos);
+    };
+
+    cout << "\n=================================================================\n";
+    cout << "  Model Information:  " << modelFile << "\n";
+    cout << "=================================================================\n\n";
+    cout << "Architecture:\n";
+    cout << "Input: " << findValue("input_width") << "x"
+         << findValue("input_height") << "x"
+         << findValue("input_channels") << "\n";
+    cout << "Output size: " << findValue("output_size") << "\n\n";
+    cout << "Training Parameters:\n";
+    cout << "Learning rate: " << findValue("learning_rate") << "\n";
+    cout << "Gradient clip: " << findValue("gradient_clip") << "\n";
+    cout << "activation: " << findValue("activation") << "\n";
+    cout << "output_activation: " << findValue("output_activation") << "\n";
+    cout << "loss_type: " << findValue("loss_type") << "\n\n";
+}
+
+void HandleCreate(int argc, char* argv[]) {
+    string saveFile = GetArgValue(argc, argv, "--save", "");
+    string inputWStr = GetArgValue(argc, argv, "--input-w", "");
+    string inputHStr = GetArgValue(argc, argv, "--input-h", "");
+    string inputCStr = GetArgValue(argc, argv, "--input-c", "");
+    string convFilters = GetArgValue(argc, argv, "--conv", "");
+    string kernels = GetArgValue(argc, argv, "--kernels", "");
+    string pools = GetArgValue(argc, argv, "--pools", "");
+    string fcLayers = GetArgValue(argc, argv, "--fc", "");
+    string outputSizeStr = GetArgValue(argc, argv, "--output", "");
+
+    if (saveFile.empty()) {
+        cerr << "Error: --save argument is required for create command" << endl;
+        return;
+    }
+    if (inputWStr.empty()) {
+        cerr << "Error: --input-w argument is required for create command" << endl;
+        return;
+    }
+    if (inputHStr.empty()) {
+        cerr << "Error: --input-h argument is required for create command" << endl;
+        return;
+    }
+    if (inputCStr.empty()) {
+        cerr << "Error: --input-c argument is required for create command" << endl;
+        return;
+    }
+    if (convFilters.empty()) {
+        cerr << "Error: --conv argument is required for create command" << endl;
+        return;
+    }
+    if (kernels.empty()) {
+        cerr << "Error: --kernels argument is required for create command" << endl;
+        return;
+    }
+    if (pools.empty()) {
+        cerr << "Error: --pools argument is required for create command" << endl;
+        return;
+    }
+    if (fcLayers.empty()) {
+        cerr << "Error: --fc argument is required for create command" << endl;
+        return;
+    }
+    if (outputSizeStr.empty()) {
+        cerr << "Error: --output argument is required for create command" << endl;
+        return;
+    }
+
+    int inputW = stoi(inputWStr);
+    int inputH = stoi(inputHStr);
+    int inputC = stoi(inputCStr);
+    int outputSize = stoi(outputSizeStr);
+
+    string hiddenActStr = GetArgValue(argc, argv, "--hidden-act", "relu");
+    string outputActStr = GetArgValue(argc, argv, "--output-act", "linear");
+    string lossStr = GetArgValue(argc, argv, "--loss", "mse");
+    double lr = stod(GetArgValue(argc, argv, "--lr", "0.001"));
+    double clip = stod(GetArgValue(argc, argv, "--clip", "5.0"));
+
+    vector<int> convFilterVec = ParseIntList(convFilters);
+    vector<int> kernelVec = ParseIntList(kernels);
+    vector<int> poolVec = ParseIntList(pools);
+    vector<int> fcVec = ParseIntList(fcLayers);
+
+    ActivationType hiddenAct = ParseActivation(hiddenActStr);
+    ActivationType outputAct = ParseActivation(outputActStr);
+    LossType lossType = ParseLoss(lossStr);
+
+    cout << "Creating CNN model...\n";
+    cout << "  Input: " << inputW << "x" << inputH << "x" << inputC << "\n";
+    
+    cout << "  Conv filters: ";
+    for (size_t i = 0; i < convFilterVec.size(); i++) {
+        if (i > 0) cout << ",";
+        cout << convFilterVec[i];
+    }
+    cout << "\n";
+    
+    cout << "  Kernel sizes: ";
+    for (size_t i = 0; i < kernelVec.size(); i++) {
+        if (i > 0) cout << ",";
+        cout << kernelVec[i];
+    }
+    cout << "\n";
+    
+    cout << "  Pool sizes: ";
+    for (size_t i = 0; i < poolVec.size(); i++) {
+        if (i > 0) cout << ",";
+        cout << poolVec[i];
+    }
+    cout << "\n";
+    
+    cout << "  FC layers: ";
+    for (size_t i = 0; i < fcVec.size(); i++) {
+        if (i > 0) cout << ",";
+        cout << fcVec[i];
+    }
+    cout << "\n";
+    
+    cout << "Output size: " << outputSize << "\n";
+    cout << "  Hidden activation: " << ActivationToStr(hiddenAct) << "\n";
+    cout << "  Output activation: " << ActivationToStr(outputAct) << "\n";
+    cout << "  Loss function: " << LossToStr(lossType) << "\n";
+    cout << fixed << setprecision(6) << "  Learning rate: " << lr << "\n";
+    cout << fixed << setprecision(2) << "  Gradient clip: " << clip << "\n";
+
+    TAdvancedCNN* cnn = new TAdvancedCNN(
+        inputW, inputH, inputC,
+        convFilterVec, kernelVec, poolVec, fcVec,
+        outputSize, hiddenAct, outputAct,
+        lossType, lr, clip
+    );
+
+    if (cnn->SaveToJSON(saveFile.c_str())) {
+        cout << "Created CNN model\n";
+        cout << "Model saved to: " << saveFile << "\n";
+    } else {
+        cerr << "Error: Failed to save model to " << saveFile << "\n";
+    }
+
+    delete cnn;
+}
+
+void HandleTrain(int argc, char* argv[]) {
+    string modelFile = GetArgValue(argc, argv, "--model", "");
+    string dataFile = GetArgValue(argc, argv, "--data", "");
+    string epochsStr = GetArgValue(argc, argv, "--epochs", "");
+    string saveFile = GetArgValue(argc, argv, "--save", "");
+    int batchSize = stoi(GetArgValue(argc, argv, "--batch-size", "32"));
+
+    if (modelFile.empty()) {
+        cerr << "Error: --model argument is required for train command" << endl;
+        return;
+    }
+    if (dataFile.empty()) {
+        cerr << "Error: --data argument is required for train command" << endl;
+        return;
+    }
+    if (epochsStr.empty()) {
+        cerr << "Error: --epochs argument is required for train command" << endl;
+        return;
+    }
+    if (saveFile.empty()) {
+        cerr << "Error: --save argument is required for train command" << endl;
+        return;
+    }
+
+    int epochs = stoi(epochsStr);
+
+    cout << "Training model...\n";
+    cout << "  Model: " << modelFile << "\n";
+    cout << "  Data: " << dataFile << "\n";
+    cout << "  Epochs: " << epochs << "\n";
+    cout << "  Batch size: " << batchSize << "\n";
+    cout << "  Save to: " << saveFile << "\n\n";
+
+    cout << "Training not fully implemented in this CLI demo.\n";
+    cout << "To implement training:\n";
+    cout << "  1. Load CSV data from " << dataFile << "\n";
+    cout << "  2. Load model from " << modelFile << "\n";
+    cout << "  3. Run training loop with TrainStep() for " << epochs << " epochs\n";
+    cout << "  4. Save updated model to " << saveFile << "\n";
+    cout << "\nSee the library API for complete training implementation.\n";
+}
+
+void HandlePredict(int argc, char* argv[]) {
+    string modelFile = GetArgValue(argc, argv, "--model", "");
+    string dataFile = GetArgValue(argc, argv, "--data", "");
+    string outputFile = GetArgValue(argc, argv, "--output", "");
+
+    if (modelFile.empty()) {
+        cerr << "Error: --model argument is required for predict command" << endl;
+        return;
+    }
+    if (dataFile.empty()) {
+        cerr << "Error: --data argument is required for predict command" << endl;
+        return;
+    }
+    if (outputFile.empty()) {
+        cerr << "Error: --output argument is required for predict command" << endl;
+        return;
+    }
+
+    cout << "Making predictions...\n";
+    cout << "  Model: " << modelFile << "\n";
+    cout << "  Data: " << dataFile << "\n";
+    cout << "  Output: " << outputFile << "\n\n";
+
+    cout << "Prediction not fully implemented in this CLI demo.\n";
+    cout << "To implement prediction:\n";
+    cout << "  1. Load model from " << modelFile << "\n";
+    cout << "  2. Load input data from CSV file: " << dataFile << "\n";
+    cout << "  3. Run Predict() on each input\n";
+    cout << "  4. Save predictions to CSV: " << outputFile << "\n";
+    cout << "\nSee the library API for complete prediction implementation.\n";
+}
+
+// ========== Main Program ==========
 int main(int argc, char* argv[]) {
-    srand(time(0));
+    srand(static_cast<unsigned int>(time(nullptr)));
 
     if (argc < 2) {
-        PrintUsage();
+        PrintHelp();
         return 0;
     }
 
-    string CmdStr = argv[1];
-    Command Cmd = cmdNone;
+    if (string(argv[1]) == "--help" || string(argv[1]) == "-h") {
+        PrintHelp();
+        return 0;
+    }
 
-    if (CmdStr == "create") Cmd = cmdCreate;
-    else if (CmdStr == "train") Cmd = cmdTrain;
-    else if (CmdStr == "predict") Cmd = cmdPredict;
-    else if (CmdStr == "info") Cmd = cmdInfo;
-    else if (CmdStr == "help" || CmdStr == "--help" || CmdStr == "-h") Cmd = cmdHelp;
-    else {
-        cerr << "Unknown command: " << CmdStr << "\n";
-        PrintUsage();
+    Command cmd = ParseCommand(argv[1]);
+
+    try {
+        switch (cmd) {
+            case cmdHelp:
+                PrintHelp();
+                break;
+
+            case cmdInfo: {
+                string modelFile = GetArgValue(argc, argv, "--model", "");
+                if (modelFile.empty()) {
+                    cerr << "Error: --model argument required for info command\n";
+                    return 1;
+                }
+                PrintModelInfo(modelFile);
+                break;
+            }
+
+            case cmdCreate:
+                HandleCreate(argc, argv);
+                break;
+
+            case cmdTrain:
+                HandleTrain(argc, argv);
+                break;
+
+            case cmdPredict:
+                HandlePredict(argc, argv);
+                break;
+
+            case cmdNone:
+            default:
+                cerr << "Unknown command: '" << argv[1] << "'\n";
+                cerr << "Run 'cnn help' for usage information\n";
+                return 1;
+        }
+    } catch (const exception& e) {
+        cerr << "Error: " << e.what() << endl;
         return 1;
-    }
-
-    if (Cmd == cmdHelp) {
-        PrintUsage();
-        return 0;
-    }
-
-    // Initialize defaults
-    int inputW = 0, inputH = 0, inputC = 0, outputSize = 0;
-    TIntArray convFilters, kernelSizes, poolSizes, fcLayerSizes;
-    double learningRate = 0.001;
-    double gradientClip = 5.0;
-    ActivationType hiddenAct = atReLU;
-    ActivationType outputAct = atLinear;
-    LossType lossType = ltMSE;
-    string modelFile = "";
-    string saveFile = "";
-
-    // Parse arguments
-    for (int i = 2; i < argc; i++) {
-        string arg = argv[i];
-        size_t eqPos = arg.find('=');
-        if (eqPos == string::npos) {
-            cerr << "Invalid argument: " << arg << "\n";
-            continue;
-        }
-
-        string key = arg.substr(0, eqPos);
-        string value = arg.substr(eqPos + 1);
-
-        if (key == "--input-w") inputW = stoi(value);
-        else if (key == "--input-h") inputH = stoi(value);
-        else if (key == "--input-c") inputC = stoi(value);
-        else if (key == "--output") outputSize = stoi(value);
-        else if (key == "--conv") ParseIntArrayHelper(value, convFilters);
-        else if (key == "--kernels") ParseIntArrayHelper(value, kernelSizes);
-        else if (key == "--pools") ParseIntArrayHelper(value, poolSizes);
-        else if (key == "--fc") ParseIntArrayHelper(value, fcLayerSizes);
-        else if (key == "--save") saveFile = value;
-        else if (key == "--model") modelFile = value;
-        else if (key == "--lr") learningRate = stod(value);
-        else if (key == "--hidden-act") hiddenAct = ParseActivation(value);
-        else if (key == "--output-act") outputAct = ParseActivation(value);
-        else if (key == "--loss") lossType = ParseLoss(value);
-        else if (key == "--clip") gradientClip = stod(value);
-        else cerr << "Unknown option: " << key << "\n";
-    }
-
-    // Execute command
-    if (Cmd == cmdCreate) {
-        if (inputW <= 0) { cerr << "Error: --input-w is required\n"; return 1; }
-        if (inputH <= 0) { cerr << "Error: --input-h is required\n"; return 1; }
-        if (inputC <= 0) { cerr << "Error: --input-c is required\n"; return 1; }
-        if (convFilters.empty()) { cerr << "Error: --conv is required\n"; return 1; }
-        if (kernelSizes.empty()) { cerr << "Error: --kernels is required\n"; return 1; }
-        if (poolSizes.empty()) { cerr << "Error: --pools is required\n"; return 1; }
-        if (fcLayerSizes.empty()) { cerr << "Error: --fc is required\n"; return 1; }
-        if (outputSize <= 0) { cerr << "Error: --output is required\n"; return 1; }
-        if (saveFile.empty()) { cerr << "Error: --save is required\n"; return 1; }
-
-        TAdvancedCNN* CNN = new TAdvancedCNN(inputW, inputH, inputC, convFilters, kernelSizes,
-                                             poolSizes, fcLayerSizes, outputSize,
-                                             hiddenAct, outputAct, lossType, 
-                                             learningRate, gradientClip);
-
-        cout << "Created CNN model:\n";
-        cout << "  Input: " << inputW << "x" << inputH << "x" << inputC << "\n";
-        
-        cout << "  Conv filters: ";
-        for (size_t i = 0; i < convFilters.size(); i++) {
-            if (i > 0) cout << ",";
-            cout << convFilters[i];
-        }
-        cout << "\n";
-        
-        cout << "  Kernel sizes: ";
-        for (size_t i = 0; i < kernelSizes.size(); i++) {
-            if (i > 0) cout << ",";
-            cout << kernelSizes[i];
-        }
-        cout << "\n";
-        
-        cout << "  Pool sizes: ";
-        for (size_t i = 0; i < poolSizes.size(); i++) {
-            if (i > 0) cout << ",";
-            cout << poolSizes[i];
-        }
-        cout << "\n";
-        
-        cout << "  FC layers: ";
-        for (size_t i = 0; i < fcLayerSizes.size(); i++) {
-            if (i > 0) cout << ",";
-            cout << fcLayerSizes[i];
-        }
-        cout << "\n";
-        
-        cout << "  Output size: " << outputSize << "\n";
-        cout << "  Hidden activation: " << ActivationToStr(hiddenAct) << "\n";
-        cout << "  Output activation: " << ActivationToStr(outputAct) << "\n";
-        cout << "  Loss function: " << LossToStr(lossType) << "\n";
-        cout << "  Learning rate: " << fixed << setprecision(6) << learningRate << "\n";
-        cout << "  Gradient clip: " << fixed << setprecision(2) << gradientClip << "\n";
-        cout << "  Saved to: " << saveFile << "\n";
-
-        delete CNN;
-    }
-    else if (Cmd == cmdTrain) {
-        cout << "Train command requires model persistence (not yet implemented)\n";
-    }
-    else if (Cmd == cmdPredict) {
-        cout << "Predict command requires model persistence (not yet implemented)\n";
-    }
-    else if (Cmd == cmdInfo) {
-        cout << "Info command requires model persistence (not yet implemented)\n";
     }
 
     return 0;
