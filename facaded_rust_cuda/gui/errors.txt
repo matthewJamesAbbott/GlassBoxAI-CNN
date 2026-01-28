@@ -1,0 +1,12 @@
+(base) matt@GPU-Squig:~/git/GlassBoxAI-CNN/facaded_rust_cuda/gui$ cargo run --release
+warning: the gold linker is deprecated and has known bugs with Rust
+  |
+  = help: consider using LLD or ld from GNU binutils instead
+
+warning: `facaded_cnn_gui` (bin "facaded_cnn_gui") generated 1 warning
+    Finished `release` profile [optimized] target(s) in 0.07s
+     Running `target/release/facaded_cnn_gui`
+QQmlApplicationEngine failed to load component
+qrc:/qt/qml/com/glassboxai/cnn/qml/main.qml:533:9: Cannot assign to non-existent property "fileMode"
+
+

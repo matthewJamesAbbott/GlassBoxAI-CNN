@@ -1,0 +1,30 @@
+[package]
+name = "facaded_cnn_gui"
+version = "0.1.0"
+edition = "2021"
+authors = ["Matthew Abbott"]
+license = "MIT"
+description = "GUI for Facaded CNN using cxx-qt"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
+
+[dependencies]
+cxx = "1.0"
+cxx-qt = "0.7"
+cxx-qt-lib = { version = "0.7", features = ["full"] }
+cudarc = { version = "0.12", features = ["cuda-12060"] }
+rand = "0.8"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+[build-dependencies]
+cxx-qt-build = "0.7"
+
+[dev-dependencies]
+# Kani is invoked via `cargo kani`, not as a regular dependency
+# See: https://model-checking.github.io/kani/install-guide.html
+
+# For running Kani proofs:
+# cargo install --locked kani-verifier
+# cargo kani
